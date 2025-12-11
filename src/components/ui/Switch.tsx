@@ -9,23 +9,24 @@ interface SwitchProps {
 
 export function Switch({ label, checked, onChange, description }: SwitchProps) {
     return (
-        <div className="flex items-center justify-between group">
+        <div className="flex items-center justify-between group gap-2">
             <div className="space-y-0.5">
-                <label className="text-sm font-medium text-gray-300 group-hover:text-white transition-colors cursor-pointer" onClick={() => onChange(!checked)}>
-                    {label}
-                </label>
+                {label && (
+                    <label className="text-sm font-medium text-stone-400 group-hover:text-stone-200 transition-colors cursor-pointer select-none" onClick={() => onChange(!checked)}>
+                        {label}
+                    </label>
+                )}
                 {description && (
-                    <p className="text-xs text-gray-500">{description}</p>
+                    <p className="text-[10px] text-stone-600 group-hover:text-stone-500 transition-colors">{description}</p>
                 )}
             </div>
             <button
                 onClick={() => onChange(!checked)}
-                className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 focus:ring-offset-gray-900 ${checked ? 'bg-gradient-to-r from-blue-600 to-purple-600' : 'bg-gray-700'
-                    }`}
+                className={`relative inline-flex h-4 w-8 items-center rounded-full transition-all focus:outline-none ring-1 ring-white/10 ${checked ? 'bg-white' : 'bg-black/40 hover:bg-white/5'}`}
             >
+                <span className="sr-only">Toggle</span>
                 <span
-                    className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform duration-200 ${checked ? 'translate-x-6' : 'translate-x-1'
-                        }`}
+                    className={`inline-block h-3 w-3 transform rounded-full shadow-sm transition-transform duration-200 ease-in-out ${checked ? 'translate-x-[18px] bg-black' : 'translate-x-[2px] bg-stone-500'}`}
                 />
             </button>
         </div>

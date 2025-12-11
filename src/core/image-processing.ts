@@ -25,20 +25,21 @@ export interface ProcessOptions {
     blur: number;       // 0-10 (px)
     threshold: number;  // 0-255
     invert: boolean;
+    mode: 'luminance' | 'edges'; // V32: Detection Mode
+    highRes: boolean;            // V32: High Resolution Mode
 }
 
 export const processImage = (
     image: HTMLImageElement,
     options: ProcessOptions
 ): TraceResult => {
-    const { blur, threshold, invert } = options;
+    const { blur, threshold, invert, mode, highRes } = options;
     const canvas = document.createElement('canvas');
     const ctx = canvas.getContext('2d');
     if (!ctx) throw new Error('Could not get 2d context');
 
-    // Resize for performance/consistency if needed, but keeping original resolution for now
-    // or capping max dimension to avoid huge processing costs.
-    const MAX_DIM = 1024; // Increased for better detail if needed
+    // V32: High Res Mode (up to 2500px for sharp text/logos)
+    const MAX_DIM = highRes ? 2500 : 1024;
     let width = image.width;
     let height = image.height;
 
@@ -61,45 +62,109 @@ export const processImage = (
     const imageData = ctx.getImageData(0, 0, width, height);
     const data = imageData.data;
 
-    // 2. Binary Grid Generation (Thresholding)
     const grid: number[][] = [];
-    for (let y = 0; y < height; y++) {
-        const row: number[] = [];
-        for (let x = 0; x < width; x++) {
-            const idx = (y * width + x) * 4;
-            // Simple luminance
-            const r = data[idx];
-            const g = data[idx + 1];
-            const b = data[idx + 2];
-            const a = data[idx + 3];
 
-            if (a < 50) {
-                row.push(0); // Transparent is empty
-                continue;
-            }
+    // V32: Sobel Edge Detection
+    if (mode === 'edges') {
+        const gray = new Uint8Array(width * height);
 
-            const luma = 0.299 * r + 0.587 * g + 0.114 * b; // CCIR 601
-
-            // Invert logic: 
-            // Standard: Dark = 1 (Solid), Light = 0 (Empty) -> For drawing on white paper
-            // Invert checked: Light = 1, Dark = 0 -> For white chalk on blackboard
-
-            // Default (invert=false should be standard drawing trace):
-            // Luma < Threshold => Dark => Solid (1)
-
-            let val = luma < threshold ? 1 : 0;
-
-            if (invert) {
-                // Invert means we want Light areas to be Solid
-                val = 1 - val;
-            }
-
-            row.push(val);
+        // Convert to Grayscale first
+        for (let i = 0; i < width * height; i++) {
+            const idx = i * 4;
+            // CCIR 601
+            gray[i] = 0.299 * data[idx] + 0.587 * data[idx + 1] + 0.114 * data[idx + 2];
         }
-        grid.push(row);
+
+        const sobelData = new Uint8Array(width * height);
+
+        // Sobel Kernels
+        // Gx: [-1 0 1]
+        //     [-2 0 2]
+        //     [-1 0 1]
+        // Gy: [-1 -2 -1]
+        //     [ 0  0  0]
+        //     [ 1  2  1]
+
+        for (let y = 0; y < height; y++) {
+            const row: number[] = [];
+            for (let x = 0; x < width; x++) {
+                if (x === 0 || x === width - 1 || y === 0 || y === height - 1) {
+                    row.push(0);
+                    continue;
+                }
+
+                // Gx
+                const gx =
+                    (-1 * gray[(y - 1) * width + (x - 1)]) + (0 * gray[(y - 1) * width + x]) + (1 * gray[(y - 1) * width + (x + 1)]) +
+                    (-2 * gray[y * width + (x - 1)]) + (0 * gray[y * width + x]) + (2 * gray[y * width + (x + 1)]) +
+                    (-1 * gray[(y + 1) * width + (x - 1)]) + (0 * gray[(y + 1) * width + x]) + (1 * gray[(y + 1) * width + (x + 1)]);
+
+                // Gy
+                const gy =
+                    (-1 * gray[(y - 1) * width + (x - 1)]) + (-2 * gray[(y - 1) * width + x]) + (-1 * gray[(y - 1) * width + (x + 1)]) +
+                    (0 * gray[y * width + (x - 1)]) + (0 * gray[y * width + x]) + (0 * gray[y * width + (x + 1)]) +
+                    (1 * gray[(y + 1) * width + (x - 1)]) + (2 * gray[(y + 1) * width + x]) + (1 * gray[(y + 1) * width + (x + 1)]);
+
+                const mag = Math.sqrt(gx * gx + gy * gy);
+
+                // Edge Thresholding
+                // Mag > threshold => Edge (1)
+                // Invert? Usually Edges are 1 (Solid). 
+                // If Invert is checked, maybe we want Non-Edges? Rare, but logic applies.
+
+                let val = mag > threshold ? 1 : 0;
+
+                if (invert) val = 1 - val;
+
+                row.push(val);
+            }
+            grid.push(row);
+        }
+
+    } else {
+        // Standard Luminance Threshold
+        for (let y = 0; y < height; y++) {
+            const row: number[] = [];
+            for (let x = 0; x < width; x++) {
+                const idx = (y * width + x) * 4;
+                const r = data[idx];
+                const g = data[idx + 1];
+                const b = data[idx + 2];
+                const a = data[idx + 3];
+
+                if (a < 50) {
+                    row.push(0); // Transparent
+                    continue;
+                }
+
+                const luma = 0.299 * r + 0.587 * g + 0.114 * b;
+
+                // Luma < Threshold => Dark => Solid (1)
+                let val = luma < threshold ? 1 : 0;
+
+                if (invert) val = 1 - val;
+
+                row.push(val);
+            }
+            grid.push(row);
+        }
     }
 
     const contours = extractContours(grid, width, height);
+
+    // V27: Map contours back to original image space if resizing occurred
+    const originalWidth = image.width;
+    const originalHeight = image.height;
+
+    if (width !== originalWidth || height !== originalHeight) {
+        const scaleX = originalWidth / width;
+        const scaleY = originalHeight / height;
+
+        const scaledContours = contours.map(c =>
+            c.map(p => new THREE.Vector2(p.x * scaleX, p.y * scaleY))
+        );
+        return { contours: scaledContours, width: originalWidth, height: originalHeight };
+    }
 
     return { contours, width, height };
 };

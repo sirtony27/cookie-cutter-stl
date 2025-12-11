@@ -54,7 +54,8 @@ function App() {
   // Persistence: Load initial settings from localStorage if available
   const [settings, setSettings] = useState<CutterSettings>(() => {
     const saved = localStorage.getItem('cookie_cutter_settings');
-    return saved ? JSON.parse(saved) : DEFAULT_SETTINGS;
+    // V25.2 Fix: Merge saved settings with DEFAULT_SETTINGS to ensure new fields (like keychainHoleOffset) exist
+    return saved ? { ...DEFAULT_SETTINGS, ...JSON.parse(saved) } : DEFAULT_SETTINGS;
   });
 
   // History for Contours & Roles & NodeTypes
@@ -127,6 +128,10 @@ function App() {
 
   // V12: Reference Image for Designer Mode
   const [referenceImage, setReferenceImage] = useState<string | null>(null);
+
+  // V28/V30: Sidebar State
+  const [isSidebarOpen, setIsSidebarOpen] = useState(true);
+  const [isInputCollapsed, setIsInputCollapsed] = useState(false);
 
   // Handlers required by UI
   const handleViewerChange = (key: string, value: any) => {
@@ -306,229 +311,250 @@ function App() {
   };
 
   return (
-    <div className="min-h-screen bg-gray-900 text-white selection:bg-blue-500/30">
-      {/* Header */}
-      <header className="border-b border-white/10 bg-white/5 backdrop-blur-lg sticky top-0 z-10">
-        <div className="container mx-auto px-4 py-4 flex items-center justify-between">
+    <div className="h-screen bg-black text-stone-200 selection:bg-white/20 flex flex-col overflow-hidden">
+      <header className="border-b border-white/5 bg-black/50 backdrop-blur-lg sticky top-0 z-50 h-[50px] flex items-center shrink-0">
+        <div className="w-full px-4 flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <div className="w-10 h-10 bg-gradient-to-r from-blue-500 to-purple-500 rounded-lg flex items-center justify-center shadow-lg shadow-blue-500/20">
-              <Cookie className="w-6 h-6 text-white" />
+            <div className="w-7 h-7 bg-white text-black rounded flex items-center justify-center shadow-lg shadow-white/5">
+              <Cookie className="w-4 h-4 fill-current" />
             </div>
-            <h1 className="text-xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-white to-gray-400">
-              CookieCutter<span className="text-blue-500">Gen</span> <span className="text-xs bg-blue-500/20 text-blue-300 px-2 py-0.5 rounded ml-2">V13</span>
+            <h1 className="text-sm font-bold text-white tracking-tight flex items-center gap-2">
+              CookieCutter<span className="font-light opacity-50">Gen</span>
+              <span className="text-[9px] bg-blue-500/10 text-blue-300 border border-blue-500/20 px-1.5 py-0.5 rounded font-mono uppercase tracking-wider">PRO</span>
             </h1>
           </div>
-          <div className="text-sm text-gray-400 hidden sm:block">
-            Alta Calidad • Edición Avanzada
+
+          <div className="flex items-center gap-3">
+            <button
+              onClick={() => setIsSidebarOpen(!isSidebarOpen)}
+              className={`text-xs px-2 py-1 rounded border transition-colors ${isSidebarOpen ? 'bg-white/10 border-white/10 text-white' : 'border-white/5 text-stone-500 hover:text-white'}`}
+              title={isSidebarOpen ? "Ocultar Controles" : "Mostrar Controles"}
+            >
+              {isSidebarOpen ? 'Sidebar' : 'Sidebar'}
+            </button>
+            <div className="text-[10px] text-stone-600 font-mono">
+              v31.0
+            </div>
           </div>
         </div>
-      </header>
+      </header >
 
-      <main className="container mx-auto px-4 py-8">
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+      <main className="flex-1 flex flex-row overflow-hidden relative">
+        {/* Left Column: Canvas & Input */}
+        <div className="flex-1 flex flex-col min-w-0 bg-[#0a0a0a] relative">
 
-          {/* Left Column: Input & Preview */}
-          <div className="lg:col-span-2 space-y-6">
+          {/* 3D Viewer / Editor Area - Full Height */}
+          <div className="flex-1 relative bg-gray-900/50 overflow-hidden flex flex-col h-full w-full">
 
-            {/* 3D Viewer / Editor Area */}
-            <div className="relative group h-[600px] bg-gray-800/50 rounded-xl overflow-hidden border border-white/5">
-
-              {/* View Toggle */}
-              {/* View Toggle & Undo/Redo */}
-              <div className="absolute top-4 right-4 z-20 flex flex-col items-end gap-2">
-                <div className="flex bg-black/40 rounded-lg p-1 backdrop-blur-md border border-white/10">
-                  <button
-                    className={`px-3 py-1.5 rounded-md text-xs font-bold transition-all ${!isNodeEditorMode ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-white'}`}
-                    onClick={() => setIsNodeEditorMode(false)}
-                  >
-                    3D
-                  </button>
-                  <button
-                    className={`px-3 py-1.5 rounded-md text-xs font-bold transition-all ${isNodeEditorMode ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-white'}`}
-                    onClick={() => setIsNodeEditorMode(true)}
-                  >
-                    2D (Nodos)
-                  </button>
-                </div>
-
-                {isNodeEditorMode && contours && (
-                  <div className="flex bg-black/40 rounded-lg p-1 backdrop-blur-md border border-white/10 gap-1">
-                    <button
-                      onClick={undoDesign}
-                      disabled={!canUndoDesign}
-                      className="p-1.5 text-gray-300 hover:text-white disabled:opacity-30 disabled:hover:text-gray-300 transition-colors"
-                      title="Deshacer (Undo)"
-                    >
-                      <Undo2 className="w-4 h-4" />
-                    </button>
-                    <div className="w-px bg-white/10 my-1" />
-                    <button
-                      onClick={redoDesign}
-                      disabled={!canRedoDesign}
-                      className="p-1.5 text-gray-300 hover:text-white disabled:opacity-30 disabled:hover:text-gray-300 transition-colors"
-                      title="Rehacer (Redo)"
-                    >
-                      <Redo2 className="w-4 h-4" />
-                    </button>
-                  </div>
-                )}
-              </div>
-
-              {!isNodeEditorMode ? (
-                <>
-                  <Viewer3D
-                    parts={geometryParts}
-                    colors={viewerSettings}
-                    autoRotate={viewerSettings.autoRotate && !isEditMode}
-                    isEditMode={isEditMode}
-                    hiddenPartIds={hiddenPartIds}
-                    onTogglePart={handleTogglePart}
-                  />
-                  {isEditMode && (
-                    <div className="absolute top-4 left-4 bg-red-500/20 text-red-100 border border-red-500/30 px-3 py-1.5 rounded-full text-sm font-medium backdrop-blur-md flex items-center gap-2 animate-pulse pointer-events-none">
-                      <div className="w-2 h-2 bg-red-500 rounded-full" />
-                      Modo Borrador Activo
-                    </div>
-                  )}
-                </>
-              ) : (
-                contours && imageDims && (
-                  <ContourEditor
-                    contours={contours}
-                    width={imageDims.width}
-                    height={imageDims.height}
-                    onChange={updateDesign}
-                    referenceImage={referenceImage}
-                    roles={contourRoles}
-                    nodeTypes={nodeTypes}
-                    onUndo={undoDesign}
-                    onRedo={redoDesign}
-                  />
-                )
-              )}
-
-              {isProcessing && (
-                <div className="absolute inset-0 bg-black/60 backdrop-blur-sm z-20 flex flex-col items-center justify-center rounded-xl">
-                  <Wand2 className="w-10 h-10 text-blue-500 animate-spin mb-4" />
-                  <p className="font-medium text-lg">Procesando Diseño...</p>
-                </div>
-              )}
-            </div>
-
-            {/* Error Message */}
-            {error && (
-              <div className="bg-red-500/10 border border-red-500/20 rounded-lg p-4 text-red-400 text-sm">
-                {error}
-              </div>
-            )}
-
-            {/* Input Selection Tabs */}
-            <div className="bg-white/5 border border-white/10 rounded-xl p-1 flex gap-1">
-              <button
-                onClick={() => { setInputMode('upload'); resetAppDesign(null); setGeometryParts([]); setReferenceImage(null); }}
-                className={`flex-1 py-3 rounded-lg text-xs md:text-sm font-bold transition-all flex items-center justify-center gap-2
-                        ${inputMode === 'upload' ? 'bg-blue-600 text-white shadow-lg' : 'text-gray-400 hover:text-white hover:bg-white/5'}`}
-              >
-                <Upload className="w-4 h-4" />
-                <span className="hidden sm:inline">Magic Trace</span>
-              </button>
-              <button
-                onClick={() => { setInputMode('designer'); resetAppDesign([]); setGeometryParts([]); setReferenceImage(null); setIsNodeEditorMode(true); }}
-                className={`flex-1 py-3 rounded-lg text-xs md:text-sm font-bold transition-all flex items-center justify-center gap-2
-                        ${inputMode === 'designer' ? 'bg-purple-600 text-white shadow-lg' : 'text-gray-400 hover:text-white hover:bg-white/5'}`}
-              >
-                <Pencil className="w-4 h-4" />
-                <span className="hidden sm:inline">Diseñador</span>
-              </button>
-              <button
-                onClick={() => { setInputMode('text'); resetAppDesign(null); setGeometryParts([]); setReferenceImage(null); }}
-                className={`flex-1 py-3 rounded-lg text-xs md:text-sm font-bold transition-all flex items-center justify-center gap-2
-                        ${inputMode === 'text' ? 'bg-green-600 text-white shadow-lg' : 'text-gray-400 hover:text-white hover:bg-white/5'}`}
-              >
-                <Type className="w-4 h-4" />
-                <span className="hidden sm:inline">Texto</span>
-              </button>
-            </div>
-
-            {/* Conditional Input Area */}
-            {processingImg ? (
-              <div className="h-[600px] bg-gray-900 rounded-xl overflow-hidden border border-white/10 shadow-2xl">
-                <ImageProcessor
-                  imageSrc={processingImg.src}
-                  onConfirm={(options) => runTrace(processingImg.element, options)}
-                  onCancel={() => setProcessingImg(null)}
-                />
-              </div>
-            ) : inputMode === 'upload' ? (
-              (!contours) && (
-                <div className="bg-white/5 border border-white/10 rounded-xl p-6">
-                  <h3 className="text-lg font-bold mb-4 flex items-center gap-2">
-                    <Upload className="w-5 h-5 text-blue-400" />
-                    Subir Imagen para Tracear
-                  </h3>
-                  <Dropzone onImageLoaded={handleImageLoaded} />
-                </div>
-              )
-            ) : inputMode === 'designer' ? (
-              <div className="bg-white/5 border border-white/10 rounded-xl p-6">
-                <h3 className="text-lg font-bold mb-4 flex items-center gap-2">
-                  <Pencil className="w-5 h-5 text-purple-400" />
-                  Modo Diseñador (Calco)
-                </h3>
-                <p className="text-sm text-gray-400 mb-4">Sube una imagen de referencia para dibujar encima, o empieza en blanco.</p>
-
-                {!referenceImage ? (
-                  <Dropzone onImageLoaded={handleReferenceLoaded} />
-                ) : (
-                  <div className="flex items-center gap-4 bg-black/20 p-4 rounded-lg">
-                    <img src={referenceImage} className="w-16 h-16 object-cover rounded border border-white/10" />
-                    <div className="flex-1">
-                      <div className="text-sm font-bold text-white">Imagen de Referencia Cargada</div>
-                      <div className="text-xs text-gray-400">Usa el Editor 2D para dibujar.</div>
-                    </div>
-                    <button
-                      onClick={() => setReferenceImage(null)}
-                      className="text-xs text-red-400 hover:underline"
-                    >
-                      Quitar
-                    </button>
-                  </div>
-                )}
-
-                {/* Start Blank Button */}
-                {!contours && !referenceImage && (
-                  <button
-                    onClick={() => {
-                      updateDesign([], []);
-                      setImageDims({ width: 800, height: 800 }); // Default canvas
-                      setIsNodeEditorMode(true);
-                    }}
-                    className="mt-4 w-full py-2 bg-white/5 hover:bg-white/10 border border-white/10 rounded-lg text-sm text-gray-300 transition-colors"
-                  >
-                    Empezar con Lienzo en Blanco (800x800)
-                  </button>
-                )}
-              </div>
-            ) : (
-              <TextInput onImageGenerated={handleTextGenerated} />
-            )}
-
-            {/* Reset Button (Only for Upload Mode and NOT processing) */}
-            {contours && inputMode === 'upload' && !processingImg && (
-              <div className="flex justify-end">
+            {/* View Toggle & Undo/Redo */}
+            <div className="absolute top-4 right-4 z-20 flex flex-col items-end gap-2 pointer-events-none">
+              {/* Make buttons pointer-events-auto */}
+              <div className="flex bg-black/40 rounded-lg p-1 backdrop-blur-md border border-white/10 pointer-events-auto">
                 <button
-                  onClick={() => { resetAppDesign(null); setGeometryParts([]); }}
-                  className="text-sm text-gray-400 hover:text-white underline underline-offset-4"
+                  className={`px-3 py-1.5 rounded-md text-xs font-bold transition-all ${!isNodeEditorMode ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-white'}`}
+                  onClick={() => setIsNodeEditorMode(false)}
                 >
-                  Subir otra imagen
+                  3D
                 </button>
+                <button
+                  className={`px-3 py-1.5 rounded-md text-xs font-bold transition-all ${isNodeEditorMode ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-white'}`}
+                  onClick={() => setIsNodeEditorMode(true)}
+                >
+                  2D (Nodos)
+                </button>
+              </div>
+
+              {isNodeEditorMode && contours && (
+                <div className="flex bg-black/40 rounded-lg p-1 backdrop-blur-md border border-white/10 gap-1 pointer-events-auto">
+                  <button
+                    onClick={undoDesign}
+                    disabled={!canUndoDesign}
+                    className="p-1.5 text-gray-300 hover:text-white disabled:opacity-30 disabled:hover:text-gray-300 transition-colors"
+                    title="Deshacer (Undo)"
+                  >
+                    <Undo2 className="w-4 h-4" />
+                  </button>
+                  <div className="w-px bg-white/10 my-1" />
+                  <button
+                    onClick={redoDesign}
+                    disabled={!canRedoDesign}
+                    className="p-1.5 text-gray-300 hover:text-white disabled:opacity-30 disabled:hover:text-gray-300 transition-colors"
+                    title="Rehacer (Redo)"
+                  >
+                    <Redo2 className="w-4 h-4" />
+                  </button>
+                </div>
+              )}
+            </div>
+
+            {!isNodeEditorMode ? (
+              <>
+                <Viewer3D
+                  parts={geometryParts}
+                  colors={viewerSettings}
+                  autoRotate={viewerSettings.autoRotate && !isEditMode}
+                  isEditMode={isEditMode}
+                  hiddenPartIds={hiddenPartIds}
+                  onTogglePart={handleTogglePart}
+                />
+                {isEditMode && (
+                  <div className="absolute top-4 left-4 bg-red-500/20 text-red-100 border border-red-500/30 px-3 py-1.5 rounded-full text-sm font-medium backdrop-blur-md flex items-center gap-2 animate-pulse pointer-events-none">
+                    <div className="w-2 h-2 bg-red-500 rounded-full" />
+                    Modo Borrador Activo
+                  </div>
+                )}
+              </>
+            ) : (
+              contours && imageDims && (
+                <ContourEditor
+                  contours={contours}
+                  width={imageDims.width}
+                  height={imageDims.height}
+                  onChange={updateDesign}
+                  referenceImage={referenceImage}
+                  roles={contourRoles}
+                  nodeTypes={nodeTypes}
+                  onUndo={undoDesign}
+                  onRedo={redoDesign}
+                />
+              )
+            )}
+
+            {isProcessing && (
+              <div className="absolute inset-0 bg-black/60 backdrop-blur-sm z-20 flex flex-col items-center justify-center rounded-xl">
+                <Wand2 className="w-10 h-10 text-blue-500 animate-spin mb-4" />
+                <p className="font-medium text-lg">Procesando Diseño...</p>
               </div>
             )}
           </div>
 
-          {/* Right Column: Controls */}
-          <div className="lg:col-span-1">
-            <div className="space-y-6">
+          {/* Error Message */}
+          {error && (
+            <div className="bg-red-500/10 border border-red-500/20 rounded-lg p-4 text-red-400 text-sm shrink-0">
+              {error}
+            </div>
+          )}
+
+          {/* Input Selection Tabs (Collapsible - Floating Bottom or Top?) - Let's keep it Top but clean */}
+          <div className={`shrink-0 border-b border-white/5 bg-[#0f0f0f] px-4 py-2 flex items-center gap-2 transition-all duration-300 ${isInputCollapsed ? 'h-[50px]' : ''}`}>
+            {/* Header/Tabs */}
+            <button
+              onClick={() => setIsInputCollapsed(!isInputCollapsed)}
+              className="p-2 bg-white/5 hover:bg-white/10 rounded text-stone-400 hover:text-white transition-colors"
+              title={isInputCollapsed ? "Mostrar Entradas" : "Ocultar Entradas"}
+            >
+              {isInputCollapsed ? (
+                <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m18 15-6-6-6 6" /></svg>
+              ) : (
+                <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m6 9 6 6 6-6" /></svg>
+              )}
+            </button>
+
+            <div className={`flex-1 flex gap-1 ${isInputCollapsed ? 'opacity-50 pointer-events-none' : ''}`}>
+              <div className="bg-black/20 p-0.5 rounded-lg flex gap-1 border border-white/5 flex-1 max-w-md">
+                <button
+                  onClick={() => { setInputMode('upload'); resetAppDesign(null); setGeometryParts([]); setReferenceImage(null); }}
+                  className={`flex-1 py-3 rounded-lg text-xs md:text-sm font-bold transition-all flex items-center justify-center gap-2
+                            ${inputMode === 'upload' ? 'bg-blue-600 text-white shadow-lg' : 'text-gray-400 hover:text-white hover:bg-white/5'}`}
+                >
+                  <Upload className="w-4 h-4" />
+                  <span className="hidden sm:inline">Magic Trace</span>
+                </button>
+                <button
+                  onClick={() => { setInputMode('designer'); resetAppDesign([]); setGeometryParts([]); setReferenceImage(null); setIsNodeEditorMode(true); }}
+                  className={`flex-1 py-3 rounded-lg text-xs md:text-sm font-bold transition-all flex items-center justify-center gap-2
+                            ${inputMode === 'designer' ? 'bg-purple-600 text-white shadow-lg' : 'text-gray-400 hover:text-white hover:bg-white/5'}`}
+                >
+                  <Pencil className="w-4 h-4" />
+                  <span className="hidden sm:inline">Diseñador</span>
+                </button>
+                <button
+                  onClick={() => { setInputMode('text'); resetAppDesign(null); setGeometryParts([]); setReferenceImage(null); }}
+                  className={`flex-1 py-3 rounded-lg text-xs md:text-sm font-bold transition-all flex items-center justify-center gap-2
+                            ${inputMode === 'text' ? 'bg-green-600 text-white shadow-lg' : 'text-gray-400 hover:text-white hover:bg-white/5'}`}
+                >
+                  <Type className="w-4 h-4" />
+                  <span className="hidden sm:inline">Texto</span>
+                </button>
+              </div>
+            </div>
+          </div>
+
+          {/* Conditional Input Area - Hidden when collapsed */}
+          {!isInputCollapsed && (
+            <div className="px-4 pb-4 bg-[#0a0a0a] border-b border-white/5">
+              {processingImg ? (
+                <div className="h-[600px] mt-4 bg-gray-900 rounded-xl overflow-hidden border border-white/10 shadow-2xl">
+                  <ImageProcessor
+                    imageSrc={processingImg.src}
+                    onConfirm={(options) => runTrace(processingImg.element, options)}
+                    onCancel={() => setProcessingImg(null)}
+                  />
+                </div>
+              ) : inputMode === 'upload' ? (
+                (!contours) && (
+                  <div className="bg-white/5 border border-white/10 rounded-xl p-6">
+                    {/* Dropzone Content */}
+                    <h3 className="text-lg font-bold mb-4 flex items-center gap-2">
+                      <Upload className="w-5 h-5 text-blue-400" />
+                      Subir Imagen para Tracear
+                    </h3>
+                    <Dropzone onImageLoaded={handleImageLoaded} />
+                  </div>
+                )
+              ) : inputMode === 'designer' ? (
+                <div className="bg-white/5 border border-white/10 rounded-xl p-6">
+                  {/* Designer Content */}
+                  <h3 className="text-lg font-bold mb-4 flex items-center gap-2">
+                    <Pencil className="w-5 h-5 text-purple-400" />
+                    Modo Diseñador (Calco)
+                  </h3>
+                  <p className="text-sm text-gray-400 mb-4">Sube una imagen de referencia o empieza en blanco.</p>
+
+                  {!referenceImage ? (
+                    <Dropzone onImageLoaded={handleReferenceLoaded} />
+                  ) : (
+                    <div className="flex items-center gap-4 bg-black/20 p-4 rounded-lg">
+                      <img src={referenceImage} className="w-16 h-16 object-cover rounded border border-white/10" />
+                      <div className="flex-1">
+                        <div className="text-sm font-bold text-white">Imagen de Referencia Cargada</div>
+                        <div className="text-xs text-gray-400">Usa el Editor 2D arriba para dibujar.</div>
+                      </div>
+                      <button
+                        onClick={() => setReferenceImage(null)}
+                        className="text-xs text-red-400 hover:underline"
+                      >
+                        Quitar
+                      </button>
+                    </div>
+                  )}
+
+                  {!contours && !referenceImage && (
+                    <button
+                      onClick={() => {
+                        updateDesign([], []);
+                        setImageDims({ width: 800, height: 800 });
+                        setIsNodeEditorMode(true);
+                      }}
+                      className="mt-4 w-full py-2 bg-white/5 hover:bg-white/10 border border-white/10 rounded-lg text-sm text-gray-300 transition-colors"
+                    >
+                      Empezar con Lienzo en Blanco (800x800)
+                    </button>
+                  )}
+                </div>
+              ) : (
+                <div className="mt-2">
+                  <TextInput onImageGenerated={handleTextGenerated} />
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* Right Column: Controls (Sidebar) */}
+        {isSidebarOpen && (
+          <div className="w-[340px] flex-shrink-0 h-full overflow-y-auto border-l border-white/5 bg-[#111] custom-scrollbar z-20">
+            <div className="p-4 space-y-6 pb-20">
               <Controls
                 settings={settings}
                 onChange={setSettings}
@@ -544,17 +570,16 @@ function App() {
               <div className="mt-8 p-6 bg-blue-500/5 border border-blue-500/10 rounded-xl text-sm text-blue-200/80">
                 <p className="font-semibold text-blue-300 mb-2">Características:</p>
                 <ul className="list-disc ml-4 space-y-1 text-gray-400">
-                  <li>Suavizado Automático (RDP + Chaikin)</li>
-                  <li>Modo Set 2 Piezas (Cortador + Estampa)</li>
-                  <li>Generador de Texto Integrado</li>
+                  <li>Suavizado Automático</li>
+                  <li>Modo Set 2 Piezas</li>
+                  <li>Generador de Texto</li>
                 </ul>
               </div>
             </div>
           </div>
-
-        </div>
+        )}
       </main>
-    </div>
+    </div >
   );
 }
 

@@ -14,6 +14,7 @@ interface Viewer3DProps {
 
 export function Viewer3D({ parts, colors, autoRotate, isEditMode, hiddenPartIds, onTogglePart }: Viewer3DProps) {
     const [hoveredId, setHoveredId] = useState<string | null>(null);
+    const [isFullscreen, setIsFullscreen] = useState(false);
 
     const getColor = (type: string) => {
         switch (type) {
@@ -26,7 +27,22 @@ export function Viewer3D({ parts, colors, autoRotate, isEditMode, hiddenPartIds,
     };
 
     return (
-        <div className={`w-full h-[600px] bg-gray-900 rounded-xl overflow-hidden shadow-2xl relative border border-white/10 transition-colors duration-300 ${isEditMode ? 'border-red-500/50 shadow-red-900/10' : ''}`}>
+        <div className={`bg-gray-900 overflow-hidden shadow-2xl relative border border-white/10 transition-colors duration-300 
+            ${isFullscreen ? 'fixed inset-0 z-[9999] rounded-none w-screen h-screen' : 'w-full h-full rounded-xl'} 
+            ${isEditMode ? 'border-red-500/50 shadow-red-900/10' : ''}`}
+        >
+            <button
+                onClick={() => setIsFullscreen(!isFullscreen)}
+                className="absolute top-4 left-4 z-50 p-2 bg-black/50 hover:bg-white/20 text-white rounded-lg backdrop-blur transition-all border border-white/10"
+                title={isFullscreen ? "Salir de Pantalla Completa" : "Pantalla Completa"}
+            >
+                {isFullscreen ? (
+                    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M8 3v3a2 2 0 0 1-2 2H3" /><path d="M21 8h-3a2 2 0 0 1-2-2V3" /><path d="M3 16h3a2 2 0 0 1 2 2v3" /><path d="M16 21v-3a2 2 0 0 1 2-2h3" /></svg>
+                ) : (
+                    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3" /><path d="M21 8V5a2 2 0 0 0-2-2h-3" /><path d="M3 16v3a2 2 0 0 0 2 2h3" /><path d="M16 21h3a2 2 0 0 0 2-2v-3" /></svg>
+                )}
+            </button>
+
             {parts.length === 0 && (
                 <div className="absolute inset-0 flex flex-col items-center justify-center text-gray-500 z-10 pointer-events-none">
                     <p className="font-medium text-lg">Vista Previa 3D</p>
