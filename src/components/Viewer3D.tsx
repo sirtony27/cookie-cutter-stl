@@ -20,6 +20,7 @@ export function Viewer3D({ parts, colors, autoRotate, isEditMode, hiddenPartIds,
             case 'base': return colors.baseColor;
             case 'outer': return colors.outerColor;
             case 'inner': return colors.innerColor;
+            case 'handle': return '#f59e0b'; // Amber for handle
             default: return '#ffffff';
         }
     };

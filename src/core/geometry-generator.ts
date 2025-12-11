@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { STLExporter } from 'three-stdlib';
+
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 
 export interface CutterSettings {
@@ -12,9 +13,38 @@ export interface CutterSettings {
     withBase: boolean; // Generate base plate?
     markerHeight: number; // Height for inner details
     markerThickness: number; // Thickness for inner details
+
+    // V7: Dual Mode Settings
+    generationMode: 'single' | 'dual';
+    stampTolerance: number; // Gap between cutter and stamp (mm)
+    handleHeight: number; // Height of the stamp handle
+    handleThickness: number; // Thickness of the stamp handle
+
+    // V11.4: Automatic Bridges
+    automaticBridges: boolean;
+    // V13.2: Solid Base
+    solidBase: boolean;
+    // V15: Blade Profile
+    bladeProfile: 'standard' | 'stepped';
+    stampGrid: boolean;
+
+    // V18: Keychain Mode
+    outputType: 'cutter' | 'keychain';
+    keychainHoleDiameter: number; // mm
+
+    // V20.1: Backing Shape
+    keychainShape: 'silhouette' | 'circle' | 'square' | 'hexagon' | 'heart';
+
+    // V23: Custom Base Settings
+    keychainBasePadding?: number;
+    keychainHoleOffset?: { x: number, y: number };
+
+    // V20.3: Chamfer/Fillet
+    keychainBevelEnabled?: boolean;
+    keychainBevelSize?: number;
 }
 
-export type PartType = 'base' | 'outer' | 'inner';
+export type PartType = 'base' | 'outer' | 'inner' | 'handle' | 'bridge';
 
 export interface CutterPart {
     geometry: THREE.BufferGeometry;
@@ -23,166 +53,70 @@ export interface CutterPart {
     id: string; // Unique ID for React keys
 }
 
-export const generateGeometry = (
-    contours: THREE.Vector2[][], // Raw pixel coordinates
-    imgWidth: number,
-    imgHeight: number,
-    settings: CutterSettings
-): CutterPart[] => {
-    // 1. Normalize and Center contours
-    const scale = settings.size / Math.max(imgWidth, imgHeight);
-    const offsetX = imgWidth / 2;
-    const offsetY = imgHeight / 2;
+// Check if contour A is inside contour B
+const isPointInPolygon2D = (p: THREE.Vector2, polygon: THREE.Vector2[]) => {
+    let inside = false;
+    for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+        const xi = polygon[i].x, yi = polygon[i].y;
+        const xj = polygon[j].x, yj = polygon[j].y;
+        const intersect = ((yi > p.y) !== (yj > p.y)) &&
+            (p.x < (xj - xi) * (p.y - yi) / (yj - yi) + xi);
+        if (intersect) inside = !inside;
+    }
+    return inside;
+};
 
-    const processedContours = contours.map(contour => {
-        return contour.map(p => {
-            return new THREE.Vector2(
-                (offsetX - p.x) * scale, // Mirrored X
-                (p.y + offsetY) * scale
-            );
-        });
-    });
+interface ContourNode {
+    id: number;
+    contour: THREE.Vector2[];
+    children: ContourNode[];
+    depth: number;
+}
 
-    if (processedContours.length === 0) return [];
+const buildContourHierarchy = (contours: THREE.Vector2[][]): ContourNode[] => {
+    const nodes: ContourNode[] = contours.map((c, i) => ({ id: i, contour: c, children: [], depth: 0 }));
+    const roots: ContourNode[] = [];
 
-    // 2. Classify Contours
-    // Find the distinct outer perimeter (largest area or bounding box)
-    // For simplicity, let's assume the contour with the largest bounding box diagonal is the outer one.
-    // Or just length? Length is good for closed loops.
-    let outerIndex = 0;
-    let maxLen = 0;
-    processedContours.forEach((c, i) => {
-        // Approximate length
-        const len = c.length; // Number of points is a decent proxy if sampling is uniform
-        if (len > maxLen) {
-            maxLen = len;
-            outerIndex = i;
+    // Sort by area size (largest first) to ensure parents are processed before children
+    const areas = contours.map((c, i) => ({ area: Math.abs(THREE.ShapeUtils.area(c)), index: i }));
+    areas.sort((a, b) => b.area - a.area);
+
+    for (let i = 0; i < areas.length; i++) {
+        const currentIdx = areas[i].index;
+        const currentNode = nodes[currentIdx];
+
+        let bestParent: ContourNode | null = null;
+        let smallestParentArea = Infinity;
+
+        // Check against all POTENTIAL parents (larger areas processed before)
+        for (let j = 0; j < i; j++) {
+            const parentIdx = areas[j].index;
+            const parentNode = nodes[parentIdx];
+
+            // Check if current is inside parent
+            // Test first point of current
+            if (isPointInPolygon2D(currentNode.contour[0], parentNode.contour)) {
+                if (areas[j].area < smallestParentArea) {
+                    smallestParentArea = areas[j].area;
+                    bestParent = parentNode;
+                }
+            }
         }
-    });
 
-    const results: CutterPart[] = [];
-
-    // 3. Generate Solid Base Plate (from Outer Contour)
-    if (settings.withBase) {
-        // Create a shape from the outer contour
-        // We want the base to be slightly wider than the cutter? 
-        // settings.baseThickness will be the "offset" amount for the base plate
-        const baseOffset = offsetContour(processedContours[outerIndex], settings.baseThickness); // Reuse offset logic
-
-        const shape = new THREE.Shape(baseOffset);
-
-        // Extrude settings for the plate
-        const extrudeSettings = {
-            depth: settings.baseHeight, // Extrude along Z
-            bevelEnabled: false,
-            // Construct the mesh "upwards" or start at 0?
-        };
-
-        const baseGeom = new THREE.ExtrudeGeometry(shape, extrudeSettings);
-        // By default ExtrudeGeometry extrudes into +Z? Or -Z? 
-        // We can just rotate if needed, but usually it's fine.
-        // Let's assume Z 0 -> +baseHeight
-        results.push({
-            geometry: baseGeom,
-            type: 'base',
-            contourIndex: outerIndex,
-            id: `base-${outerIndex}`
-        });
+        if (bestParent) {
+            bestParent.children.push(currentNode);
+            currentNode.depth = bestParent.depth + 1;
+        } else {
+            roots.push(currentNode);
+        }
     }
 
-    // 4. Generate Outer Cutter Wall (Full Height)
-    // Starts from Z = 0 ? Or Z = baseHeight?
-    // Usually cutter walls go through the base or start from it.
-    // Let's make them start from 0 to ensure solid connection, or from baseHeight?
-    // If we want a solid object, overlapping is fine.
-    // Let's start from 0 up to cutterHeight (which should be > baseHeight)
-    const cutterWall = createExtrudedWall(processedContours[outerIndex], settings.cutterHeight, settings.cutterThickness, 0);
-    results.push({
-        geometry: cutterWall,
-        type: 'outer',
-        contourIndex: outerIndex,
-        id: `outer-${outerIndex}`
-    });
-
-    // 5. Generate Inner Marker Walls (Marker Height)
-    processedContours.forEach((contour, i) => {
-        if (i === outerIndex) return; // Skip outer
-        // These are markers, so they might be shorter
-        // Height should be settings.markerHeight
-        // They also start from 0 (or baseHeight)
-        const markerWall = createExtrudedWall(contour, settings.markerHeight, settings.markerThickness, 0);
-        results.push({
-            geometry: markerWall,
-            type: 'inner',
-            contourIndex: i,
-            id: `inner-${i}`
-        });
-    });
-
-    return results;
+    return roots;
 };
 
-const createExtrudedWall = (
-    contour: THREE.Vector2[],
-    height: number,
-    thickness: number,
-    zStart: number = 0
-): THREE.BufferGeometry => {
-    // Generate ribbon
-    // Need 2 loops: Inner and Outer
-    // Inner = contour
-    // Outer = offsetContour(contour, thickness)
-
-    const inner = contour;
-    const outer = offsetContour(contour, thickness);
-
-    const numPoints = inner.length;
-    const vertices: number[] = [];
-
-    // Vertices order:
-    // Quad 1: Inner Wall (Inner[i], Inner[i+1], Inner[i+1]+H, Inner[i]+H)
-    // Quad 2: Outer Wall (Outer[i+1], Outer[i], Outer[i]+H, Outer[i+1]+H)
-    // Quad 3: Top Cap (Inner[i]+H, Inner[i+1]+H, Outer[i+1]+H, Outer[i]+H)
-    // Quad 4: Bottom Cap (Inner[i+1], Inner[i], Outer[i], Outer[i+1])
-
-    const pushQuad = (p1: THREE.Vector3, p2: THREE.Vector3, p3: THREE.Vector3, p4: THREE.Vector3) => {
-        // Tri 1: p1, p2, p4
-        vertices.push(p1.x, p1.y, p1.z);
-        vertices.push(p2.x, p2.y, p2.z);
-        vertices.push(p4.x, p4.y, p4.z);
-
-        // Tri 2: p2, p3, p4
-        vertices.push(p2.x, p2.y, p2.z);
-        vertices.push(p3.x, p3.y, p3.z);
-        vertices.push(p4.x, p4.y, p4.z);
-    };
-
-    for (let i = 0; i < numPoints; i++) {
-        const next = (i + 1) % numPoints;
-
-        const i1 = new THREE.Vector3(inner[i].x, inner[i].y, zStart);
-        const i2 = new THREE.Vector3(inner[next].x, inner[next].y, zStart);
-        const i1_top = new THREE.Vector3(inner[i].x, inner[i].y, zStart + height);
-        const i2_top = new THREE.Vector3(inner[next].x, inner[next].y, zStart + height);
-
-        const o1 = new THREE.Vector3(outer[i].x, outer[i].y, zStart);
-        const o2 = new THREE.Vector3(outer[next].x, outer[next].y, zStart);
-        const o1_top = new THREE.Vector3(outer[i].x, outer[i].y, zStart + height);
-        const o2_top = new THREE.Vector3(outer[next].x, outer[next].y, zStart + height);
-
-        pushQuad(i1_top, i2_top, i2, i1); // Inner facing "in" (towards shape center)
-        pushQuad(o1, o2, o2_top, o1_top); // Outer facing "out"
-        pushQuad(i1_top, o1_top, o2_top, i2_top); // Top Rim
-        pushQuad(i2, o2, o1, i1); // Bottom Rim
-    }
-
-    const geom = new THREE.BufferGeometry();
-    geom.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
-    geom.computeVertexNormals();
-    return geom;
-};
-
+// Helper to expand a contour
 const offsetContour = (contour: THREE.Vector2[], distance: number): THREE.Vector2[] => {
+    if (distance === 0) return contour.map(p => p.clone());
     const result: THREE.Vector2[] = [];
     const len = contour.length;
     for (let i = 0; i < len; i++) {
@@ -194,7 +128,7 @@ const offsetContour = (contour: THREE.Vector2[], distance: number): THREE.Vector
         const v1 = new THREE.Vector2().subVectors(curr, prev).normalize();
         const v2 = new THREE.Vector2().subVectors(next, curr).normalize();
 
-        // Normals (Rotate -90 deg for "Outside")
+        // Normals (Rotate -90 deg for "Outside" if CCW)
         const n1 = new THREE.Vector2(v1.y, -v1.x);
         const n2 = new THREE.Vector2(v2.y, -v2.x);
 
@@ -203,11 +137,11 @@ const offsetContour = (contour: THREE.Vector2[], distance: number): THREE.Vector
 
         // Miter length adjustment
         const dot = bisector.dot(n1);
-        const miter = distance / Math.max(dot, 0.1); // Avoid div by zero
+        const miter = distance / Math.max(dot, 0.1);
 
         // Limit miter to avoid huge spikes
-        const limit = distance * 2;
-        const offsetDist = Math.min(miter, limit);
+        const limit = Math.abs(distance) * 2;
+        const offsetDist = Math.max(-limit, Math.min(miter, limit));
 
         const offset = bisector.multiplyScalar(offsetDist);
         result.push(new THREE.Vector2().addVectors(curr, offset));
@@ -215,24 +149,813 @@ const offsetContour = (contour: THREE.Vector2[], distance: number): THREE.Vector
     return result;
 };
 
+// Helper: Wall Geometry
+const createExtrudedWall = (
+    contour: THREE.Vector2[],
+    height: number,
+    thickness: number,
+    zStart: number = 0
+): THREE.BufferGeometry => {
+    // Inner = contour
+    // Outer = offsetContour(contour, thickness)
+    const inner = contour;
+    const outer = offsetContour(contour, thickness);
 
+    // If offset failed (empty), fallback to inner
+    if (outer.length !== inner.length) return new THREE.BufferGeometry();
 
-export const exportToSTL = (parts: CutterPart[], hiddenPartIds: Set<string>): Blob => {
-    const exporter = new STLExporter();
+    const numPoints = inner.length;
+    const vertices: number[] = [];
 
-    // Filter out hidden parts
-    const visibleGeometries = parts
-        .filter(p => !hiddenPartIds.has(p.id))
-        .map(p => p.geometry);
+    // Quad Helper
+    const pushQuad = (p1: THREE.Vector3, p2: THREE.Vector3, p3: THREE.Vector3, p4: THREE.Vector3) => {
+        // Tri 1: p1, p2, p4
+        vertices.push(p1.x, p1.y, p1.z);
+        vertices.push(p2.x, p2.y, p2.z);
+        vertices.push(p4.x, p4.y, p4.z);
+        // Tri 2: p2, p3, p4
+        vertices.push(p2.x, p2.y, p2.z);
+        vertices.push(p3.x, p3.y, p3.z);
+        vertices.push(p4.x, p4.y, p4.z);
+    };
 
-    if (visibleGeometries.length === 0) {
-        // Return empty or dummy
-        return new Blob([], { type: 'application/octet-stream' });
+    for (let i = 0; i < numPoints; i++) {
+        const next = (i + 1) % numPoints;
+
+        // Bottom Z = zStart, Top Z = zStart + height
+        const zBot = zStart;
+        const zTop = zStart + height;
+
+        const i1 = new THREE.Vector3(inner[i].x, inner[i].y, zBot);
+        const i2 = new THREE.Vector3(inner[next].x, inner[next].y, zBot);
+        const i1_top = new THREE.Vector3(inner[i].x, inner[i].y, zTop);
+        const i2_top = new THREE.Vector3(inner[next].x, inner[next].y, zTop);
+
+        const o1 = new THREE.Vector3(outer[i].x, outer[i].y, zBot);
+        const o2 = new THREE.Vector3(outer[next].x, outer[next].y, zBot);
+        const o1_top = new THREE.Vector3(outer[i].x, outer[i].y, zTop);
+        const o2_top = new THREE.Vector3(outer[next].x, outer[next].y, zTop);
+
+        // 1. Inner Wall (facing IN)
+        // i1_top -> i2_top -> i2 -> i1
+        pushQuad(i1_top, i2_top, i2, i1);
+
+        // 2. Outer Wall (facing OUT)
+        // o1 -> o2 -> o2_top -> o1_top
+        pushQuad(o1, o2, o2_top, o1_top);
+
+        // 3. Top Cap (Rim)
+        // i1_top -> o1_top -> o2_top -> i2_top
+        pushQuad(i1_top, o1_top, o2_top, i2_top);
+
+        // 4. Bottom Cap (Rim)
+        // i2 -> o2 -> o1 -> i1
+        pushQuad(i2, o2, o1, i1);
     }
 
-    const merged = mergeGeometries(visibleGeometries);
-    const mesh = new THREE.Mesh(merged);
+    const geom = new THREE.BufferGeometry();
+    geom.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
+    geom.computeVertexNormals();
+    return geom;
+};
 
-    const result = exporter.parse(mesh, { binary: true });
+// V15: Grid Generation Math
+
+// Segment-Segment Intersection
+const getIntersection = (p1: THREE.Vector2, p2: THREE.Vector2, p3: THREE.Vector2, p4: THREE.Vector2): THREE.Vector2 | null => {
+    const denom = (p4.y - p3.y) * (p2.x - p1.x) - (p4.x - p3.x) * (p2.y - p1.y);
+    if (denom === 0) return null; // Parallel
+
+    const ua = ((p4.x - p3.x) * (p1.y - p3.y) - (p4.y - p3.y) * (p1.x - p3.x)) / denom;
+    const ub = ((p2.x - p1.x) * (p1.y - p3.y) - (p2.y - p1.y) * (p1.x - p3.x)) / denom;
+
+    if (ua >= 0 && ua <= 1 && ub >= 0 && ub <= 1) {
+        return new THREE.Vector2(p1.x + ua * (p2.x - p1.x), p1.y + ua * (p2.y - p1.y));
+    }
+    return null;
+};
+
+const createGridBase = (
+    contour: THREE.Vector2[],
+    height: number,
+    thickness: number, // Width of grid lines
+    spacing: number, // Spacing between lines
+    rimWidth: number // Width of the solid perimeter
+): THREE.BufferGeometry => {
+    // 1. Create Rim
+    // Inner = contour (already offset by tolerance in main loop)
+    // Outer = offset(contour, -rimWidth) -- Inset again for rim inner edge
+    const rimOuter = contour;
+    const rimInner = offsetContour(contour, -rimWidth);
+
+    // Rim Geometry
+    const rimGeom = createExtrudedWall(rimOuter, height, -rimWidth, 0); // Negative thickness extrudes INWARD
+
+    if (rimInner.length < 3) return rimGeom; // Too small for grid
+
+    // 2. Create Grid (Scanlines)
+    // Bounding Box
+    const box = new THREE.Box2();
+    rimInner.forEach(p => box.expandByPoint(p));
+
+    const grids: THREE.BufferGeometry[] = [rimGeom];
+
+    // X-Scan (Vertical Lines)
+    for (let x = box.min.x; x <= box.max.x; x += spacing) {
+        const p1 = new THREE.Vector2(x, box.min.y - 1);
+        const p2 = new THREE.Vector2(x, box.max.y + 1);
+
+        const intersections: number[] = [];
+
+        for (let i = 0; i < rimInner.length; i++) {
+            const next = (i + 1) % rimInner.length;
+            const hit = getIntersection(p1, p2, rimInner[i], rimInner[next]);
+            if (hit) intersections.push(hit.y);
+        }
+
+        intersections.sort((a, b) => a - b);
+
+        // Pairs define segments
+        for (let i = 0; i < intersections.length; i += 2) {
+            if (i + 1 >= intersections.length) break;
+            const yStart = intersections[i];
+            const yEnd = intersections[i + 1];
+            if (yEnd - yStart < 0.1) continue;
+
+            const barGeo = new THREE.BoxGeometry(thickness, yEnd - yStart, height);
+            barGeo.translate(x, yStart + (yEnd - yStart) / 2, height / 2);
+            grids.push(barGeo);
+        }
+    }
+
+    // Y-Scan (Horizontal Lines) - Optional: Cross Grid vs Lines
+    // Let's do Cross Grid for strength
+    for (let y = box.min.y; y <= box.max.y; y += spacing) {
+        const p1 = new THREE.Vector2(box.min.x - 1, y);
+        const p2 = new THREE.Vector2(box.max.x + 1, y);
+
+        const intersections: number[] = [];
+
+        for (let i = 0; i < rimInner.length; i++) {
+            const next = (i + 1) % rimInner.length;
+            const hit = getIntersection(p1, p2, rimInner[i], rimInner[next]);
+            if (hit) intersections.push(hit.x);
+        }
+
+        intersections.sort((a, b) => a - b);
+
+        for (let i = 0; i < intersections.length; i += 2) {
+            if (i + 1 >= intersections.length) break;
+            const xStart = intersections[i];
+            const xEnd = intersections[i + 1];
+            if (xEnd - xStart < 0.1) continue;
+
+            const barGeo = new THREE.BoxGeometry(xEnd - xStart, thickness, height);
+            barGeo.translate(xStart + (xEnd - xStart) / 2, y, height / 2);
+            grids.push(barGeo);
+        }
+    }
+
+    // Merge
+    const merged = mergeGeometries(grids, false);
+    return merged || rimGeom;
+};
+
+// Helper: Tapered Wall (Lofted Extrusion)
+// This creates a multi-section wall where inner surface is vertical,
+// but outer surface interpolates between thicknesses.
+const createTaperedWall = (
+    contour: THREE.Vector2[],
+    zStart: number,
+    heights: number[], // Height of each section (relative to previous)
+    bottomThicknesses: number[], // Thickness at bottom of each section
+    topThicknesses: number[] // Thickness at top of each section
+): THREE.BufferGeometry => {
+    // Inner surface is uniform (using contour).
+    // Outer surface varies.
+
+    // We assume matching lengths of arrays.
+    // Example: 3 Sections
+    // 1. Tip (High Detail): H=1, Thick=0.4 -> 0.4
+    // 2. Taper (Slope): H=3, Thick=0.4 -> 0.8
+    // 3. Base (Strong): H=Rest, Thick=0.8 -> 0.8
+
+    const geometries: THREE.BufferGeometry[] = [];
+    let currentZ = zStart;
+
+    for (let i = 0; i < heights.length; i++) {
+        const h = heights[i];
+        const tBot = bottomThicknesses[i];
+        const tTop = topThicknesses[i];
+
+        // If thickness is uniform, use createExtrudedWall (optimized)
+        // BUT createExtrudedWall makes vertical walls.
+        // If tBot != tTop, we need a custom loft.
+
+        // Inner Contour (Always same)
+        const inner = contour;
+        const outerBot = offsetContour(contour, tBot);
+        const outerTop = offsetContour(contour, tTop);
+
+        // Safety fallback
+        if (outerBot.length !== inner.length || outerTop.length !== inner.length) continue;
+
+        const numPoints = inner.length;
+        const vertices: number[] = [];
+
+        // Push Quad Helper (redefined here or moved to scope needed?)
+        // Let's redefine for simplicity or hoist it.
+        // It's small.
+        const pushQuad = (p1: THREE.Vector3, p2: THREE.Vector3, p3: THREE.Vector3, p4: THREE.Vector3) => {
+            vertices.push(p1.x, p1.y, p1.z, p2.x, p2.y, p2.z, p4.x, p4.y, p4.z);
+            vertices.push(p2.x, p2.y, p2.z, p3.x, p3.y, p3.z, p4.x, p4.y, p4.z);
+        };
+
+        const zBot = currentZ;
+        const zTop = currentZ + h;
+
+        for (let j = 0; j < numPoints; j++) {
+            const next = (j + 1) % numPoints;
+
+            const i1 = new THREE.Vector3(inner[j].x, inner[j].y, zBot);
+            const i2 = new THREE.Vector3(inner[next].x, inner[next].y, zBot);
+            const i1_top = new THREE.Vector3(inner[j].x, inner[j].y, zTop);
+            const i2_top = new THREE.Vector3(inner[next].x, inner[next].y, zTop);
+
+            // Outer surface depends on Bot vs Top offsets
+            const o1 = new THREE.Vector3(outerBot[j].x, outerBot[j].y, zBot);
+            const o2 = new THREE.Vector3(outerBot[next].x, outerBot[next].y, zBot);
+            const o1_top = new THREE.Vector3(outerTop[j].x, outerTop[j].y, zTop);
+            const o2_top = new THREE.Vector3(outerTop[next].x, outerTop[next].y, zTop);
+
+            // 1. Inner Wall (Vertical)
+            pushQuad(i1_top, i2_top, i2, i1);
+
+            // 2. Outer Wall (Sloped)
+            pushQuad(o1, o2, o2_top, o1_top);
+
+            // 3. Top Cap (Rim) (Only needed for top section? Or internal caps?)
+            // Internal caps are hidden. Only top section needs a cap.
+            // Actually, "stepped" implies no internal caps needed if continuous.
+            if (i === heights.length - 1) {
+                pushQuad(i1_top, o1_top, o2_top, i2_top);
+            }
+
+            // 4. Bottom Cap (Only needed for bottom section)
+            if (i === 0) {
+                pushQuad(i2, o2, o1, i1);
+            }
+        }
+
+        const sectionGeom = new THREE.BufferGeometry();
+        sectionGeom.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
+        sectionGeom.computeVertexNormals();
+        geometries.push(sectionGeom);
+
+        currentZ += h;
+    }
+
+    return mergeGeometries(geometries, true);
+};
+
+// Helper: Stepped Wall (Legacy / Backup)
+const createSteppedWall = (
+    contour: THREE.Vector2[],
+    totalHeight: number,
+    baseThickness: number,
+    tipThickness: number,
+    tipHeight: number = 1.0,
+    zStart: number = 0
+): THREE.BufferGeometry => {
+    // V23 Upgrade: Use Tapered Wall for "Stepped" profile request.
+    // Structure:
+    // 1. Tip: 1mm High, 0.4mm Thick (Vertical)
+    // 2. Transition (Taper): 3mm High, 0.4mm -> BaseThickness
+    // 3. Base: Remainder, BaseThickness (Vertical)
+
+
+    // Tip is TOP. We build from Bottom Up? No, logic above is Bottom Up.
+    // So:
+    // Element 1 (Base): Z=0 to Z=(Total - Tip - Taper). Thick = BaseT -> BaseT.
+    // Element 2 (Taper): Z to Z+Taper. Thick = BaseT -> TipT.
+    // Element 3 (Tip): Z to Top. Thick = TipT -> TipT.
+
+    // Check heights
+    const hTip = tipHeight; // 1.0
+    const hTaper = 3.0; // User requested ~smooth transition
+    const hBase = Math.max(0, totalHeight - hTip - hTaper);
+
+    const heights: number[] = [];
+    const botTs: number[] = [];
+    const topTs: number[] = [];
+
+    // 1. Base Section (if height > 0)
+    if (hBase > 0.1) {
+        heights.push(hBase);
+        botTs.push(baseThickness);
+        topTs.push(baseThickness);
+    }
+
+    // 2. Taper Section
+    heights.push(hTaper);
+    botTs.push(baseThickness); // Start thick
+    topTs.push(tipThickness);  // End thin
+
+    // 3. Tip Section
+    heights.push(hTip);
+    botTs.push(tipThickness);
+    topTs.push(tipThickness);
+
+    return createTaperedWall(contour, zStart, heights, botTs, topTs);
+};
+
+
+export const generateGeometry = (
+    contours: THREE.Vector2[][], // Raw pixel coordinates
+    roles: ('cut' | 'stamp' | 'auto' | 'base')[] | undefined,
+    imgWidth: number,
+    imgHeight: number,
+    settings: CutterSettings
+): CutterPart[] => {
+    // 1. Normalize and Center contours
+    const scale = settings.size / Math.max(imgWidth, imgHeight);
+    const offsetX = imgWidth / 2;
+    const offsetY = imgHeight / 2;
+
+    // V22: Determine Mirroring
+    // Cutter = Mirrored (default)
+    // Keychain = Normal (readable)
+    const shouldMirror = settings.outputType === 'cutter' || settings.mirror;
+
+    const processedContours = contours.map(contour => {
+        return contour.map(p => {
+            return new THREE.Vector2(
+                shouldMirror ? (offsetX - p.x) * scale : (p.x - offsetX) * scale,
+                (p.y + offsetY) * scale
+            );
+        });
+    });
+
+    if (processedContours.length === 0) return [];
+
+    // 2. Classify Contours
+    let largestIndex = 0;
+    let maxLen = 0;
+    processedContours.forEach((c, i) => {
+        const len = c.length;
+        if (len > maxLen) {
+            maxLen = len;
+            largestIndex = i;
+        }
+    });
+
+    const finalTypes = processedContours.map((_, i) => {
+        const role = roles ? roles[i] : 'auto';
+        if (role === 'cut') return 'outer';
+        if (role === 'stamp') return 'inner';
+        return i === largestIndex ? 'outer' : 'inner'; // Auto heuristic
+    });
+
+    const results: CutterPart[] = [];
+
+    // --- Automatic Bridges ---
+    if (settings.automaticBridges) {
+        const areas = processedContours.map(THREE.ShapeUtils.area);
+        const sortedIndices = processedContours.map((_, i) => i).sort((a, b) => Math.abs(areas[a]) - Math.abs(areas[b]));
+        const parentMap = new Map<number, number>();
+
+        for (let i = 0; i < sortedIndices.length; i++) {
+            const childIdx = sortedIndices[i];
+
+            if (finalTypes[childIdx] === 'outer' && !settings.automaticBridges) continue;
+
+            const childC = processedContours[childIdx];
+            let bestParent = -1;
+            let minParentArea = Infinity;
+
+            for (let j = i + 1; j < sortedIndices.length; j++) {
+                const parentIdx = sortedIndices[j];
+                const parentC = processedContours[parentIdx];
+
+                if (isPointInPolygon2D(childC[0], parentC)) {
+                    const pArea = Math.abs(areas[parentIdx]);
+                    if (pArea < minParentArea) {
+                        minParentArea = pArea;
+                        bestParent = parentIdx;
+                        break;
+                    }
+                }
+            }
+            if (bestParent !== -1) parentMap.set(childIdx, bestParent);
+        }
+
+        parentMap.forEach((parentIdx, childIdx) => {
+            const childC = processedContours[childIdx];
+            const parentC = processedContours[parentIdx];
+            let minDistSq = Infinity;
+            let pChild = new THREE.Vector2();
+            let pParent = new THREE.Vector2();
+
+            const stepC = Math.max(1, Math.floor(childC.length / 50));
+            const stepP = Math.max(1, Math.floor(parentC.length / 50));
+
+            for (let i = 0; i < childC.length; i += stepC) {
+                for (let j = 0; j < parentC.length; j += stepP) {
+                    const dSq = childC[i].distanceToSquared(parentC[j]);
+                    if (dSq < minDistSq) {
+                        minDistSq = dSq;
+                        pChild.copy(childC[i]);
+                        pParent.copy(parentC[j]);
+                    }
+                }
+            }
+
+            const bridgeVec = new THREE.Vector2().subVectors(pParent, pChild);
+            const dist = bridgeVec.length();
+            const angle = bridgeVec.angle();
+            const mid = new THREE.Vector2().addVectors(pChild, pParent).multiplyScalar(0.5);
+
+            const width = dist + 2;
+            const thickness = 3;
+            const bridgeH = Math.max(2, settings.cutterHeight - 5);
+
+            const geometry = new THREE.BoxGeometry(width, thickness, bridgeH);
+            geometry.rotateZ(angle);
+            geometry.translate(mid.x, mid.y, bridgeH / 2);
+
+            results.push({
+                geometry,
+                type: 'bridge',
+                contourIndex: childIdx,
+                id: `bridge-${childIdx}-${parentIdx}`
+            });
+        });
+    }
+
+    // --- Global Bounding Box (V20.4) ---
+    const globalBox = new THREE.Box2();
+    if (processedContours.length > 0) {
+        processedContours.forEach(c => {
+            const b = new THREE.Box2().setFromPoints(c);
+            globalBox.union(b);
+        });
+    }
+    const globalCenter = new THREE.Vector2();
+    globalBox.getCenter(globalCenter);
+    const globalSize = new THREE.Vector2();
+    globalBox.getSize(globalSize);
+    // const globalMaxDim = Math.max(globalSize.x, globalSize.y); // Unused V23
+
+    const hasManualBase = roles ? roles.some(r => r === 'base') : false;
+
+    // --- Generation Loop ---
+    processedContours.forEach((contour, i) => {
+        const type = finalTypes[i];
+
+        if (settings.outputType === 'keychain') {
+            // --- KEYCHAIN MODE ---
+
+            // 1. Base Plate Logic
+            if (settings.keychainShape === 'silhouette') {
+                if (type === 'outer') {
+                    const shape = new THREE.Shape(contour);
+                    const baseGeom = new THREE.ExtrudeGeometry(shape, {
+                        depth: settings.baseHeight,
+                        bevelEnabled: !!settings.keychainBevelEnabled,
+                        bevelThickness: settings.keychainBevelSize || 0,
+                        bevelSize: settings.keychainBevelSize || 0,
+                        bevelSegments: 3
+                    });
+                    results.push({ geometry: baseGeom, type: 'base', contourIndex: i, id: `keychain-base-${i}` });
+                }
+
+                if (i === largestIndex && settings.keychainHoleDiameter > 0) {
+                    const box = new THREE.Box2().setFromPoints(contour);
+                    const topCenter = new THREE.Vector2((box.min.x + box.max.x) / 2, box.max.y);
+
+                    const outerRadius = (settings.keychainHoleDiameter / 2) + 2;
+                    const innerRadius = settings.keychainHoleDiameter / 2;
+
+                    const tabShape = new THREE.Shape();
+                    const centerY = topCenter.y - 1;
+                    tabShape.absarc(topCenter.x, centerY, outerRadius, 0, Math.PI * 2, false);
+
+                    const holePath = new THREE.Path();
+                    holePath.absarc(topCenter.x, centerY, innerRadius, 0, Math.PI * 2, true);
+                    tabShape.holes.push(holePath);
+
+                    const tabGeom = new THREE.ExtrudeGeometry(tabShape, {
+                        depth: settings.baseHeight,
+                        bevelEnabled: !!settings.keychainBevelEnabled,
+                        bevelThickness: settings.keychainBevelSize || 0,
+                        bevelSize: settings.keychainBevelSize || 0,
+                        bevelSegments: 3
+                    });
+                    results.push({ geometry: tabGeom, type: 'base', contourIndex: -1, id: `keychain-tab` });
+                }
+            }
+
+            // Manual Base Logic
+            if (hasManualBase) {
+                if (roles && roles[i] === 'base') {
+                    const shape = new THREE.Shape(contour);
+                    const baseGeom = new THREE.ExtrudeGeometry(shape, {
+                        depth: settings.baseHeight,
+                        bevelEnabled: !!settings.keychainBevelEnabled,
+                        bevelThickness: settings.keychainBevelSize || 0,
+                        bevelSize: settings.keychainBevelSize || 0,
+                        bevelSegments: 3
+                    });
+                    results.push({ geometry: baseGeom, type: 'base', contourIndex: i, id: `keychain-manual-base-${i}` });
+                    return; // It's just a base
+                }
+            }
+
+            // 3. Raised Relief
+            if (roles && roles[i] === 'base') return;
+
+            const thickness = type === 'outer' ? settings.cutterThickness : settings.markerThickness;
+            const reliefHeight = settings.markerHeight;
+
+            // Simplified relief for non-solid mode, but we use Solid Relief (V19) mainly now
+            // This is fallback or for simple lines? 
+            // Actually, for V19 Solid Relief, we handle it POST-LOOP (lines 800+).
+            // But we still kept this "inner/outer" line generation for legacy or mixed?
+            // Wait, looking at V19 logic:
+            // "if (settings.outputType === 'keychain') { const rootNodes = ... }"
+            // That happens AFTER this loop.
+            // So THIS loop generates outlines.
+            // If we want SOLID relief, we should probably SKIP this outline generation?
+            // OR do we generate BOTH?
+            // Outline adds definition. Solid fills it.
+            // Let's keep outline for now as it makes edges crisp?
+            // Actually, Solid Relief uses ExtrudeGeometry of the SHAPE.
+            // Outline uses ExtrudedWall of the CONTOUR.
+            // Having both is fine, creates a "stroke".
+
+            const reliefGeom = createExtrudedWall(contour, reliefHeight, thickness, settings.baseHeight);
+            results.push({ geometry: reliefGeom, type: 'inner', contourIndex: i, id: `keychain-relief-outline-${i}` });
+
+        } else if (settings.generationMode === 'single') {
+            if (type === 'outer') {
+                if (settings.withBase) {
+                    if (settings.solidBase) {
+                        const shape = new THREE.Shape(contour);
+                        const baseGeom = new THREE.ExtrudeGeometry(shape, { depth: settings.baseHeight, bevelEnabled: false });
+                        results.push({ geometry: baseGeom, type: 'base', contourIndex: i, id: `base-${i}` });
+                    } else {
+                        const baseWall = createExtrudedWall(contour, settings.baseHeight, settings.baseThickness, 0);
+                        results.push({ geometry: baseWall, type: 'base', contourIndex: i, id: `base-${i}` });
+                    }
+                }
+
+                let cutterWall: THREE.BufferGeometry;
+                if (settings.bladeProfile === 'stepped') {
+                    const tipH = 1.0;
+                    const tipT = 0.4;
+                    const baseT = Math.max(settings.cutterThickness, 0.6);
+                    cutterWall = createSteppedWall(contour, settings.cutterHeight, baseT, tipT, tipH, 0);
+                } else {
+                    cutterWall = createExtrudedWall(contour, settings.cutterHeight, settings.cutterThickness, 0);
+                }
+
+                results.push({ geometry: cutterWall, type: 'outer', contourIndex: i, id: `wall-${i}` });
+
+            } else {
+                const markerWall = createExtrudedWall(contour, settings.markerHeight, settings.markerThickness, 0);
+                results.push({ geometry: markerWall, type: 'inner', contourIndex: i, id: `marker-${i}` });
+            }
+
+        } else if (settings.generationMode === 'dual') {
+            if (type === 'outer') {
+                let cutterWall: THREE.BufferGeometry;
+                if (settings.bladeProfile === 'stepped') {
+                    const tipH = 1.0;
+                    const tipT = 0.4;
+                    const baseT = Math.max(settings.cutterThickness, 0.6);
+                    cutterWall = createSteppedWall(contour, settings.cutterHeight, baseT, tipT, tipH, 0);
+                } else {
+                    cutterWall = createExtrudedWall(contour, settings.cutterHeight, settings.cutterThickness, 0);
+                }
+                results.push({ geometry: cutterWall, type: 'outer', contourIndex: i, id: `dual-cut-${i}` });
+
+                if (settings.withBase) {
+                    if (settings.solidBase) {
+                        const shape = new THREE.Shape(contour);
+                        const baseGeom = new THREE.ExtrudeGeometry(shape, { depth: settings.baseHeight, bevelEnabled: false });
+                        results.push({ geometry: baseGeom, type: 'base', contourIndex: i, id: `dual-cut-base-${i}` });
+                    } else {
+                        const baseWall = createExtrudedWall(contour, settings.baseHeight, settings.baseThickness, 0);
+                        results.push({ geometry: baseWall, type: 'base', contourIndex: i, id: `dual-cut-base-${i}` });
+                    }
+                }
+
+                const tolerance = Math.max(0.1, settings.stampTolerance);
+                const stampPlateContour = offsetContour(contour, -tolerance);
+
+                if (stampPlateContour.length > 2) {
+                    if (settings.stampGrid) {
+                        const gridGeom = createGridBase(
+                            stampPlateContour,
+                            settings.baseHeight,
+                            0.8,
+                            4.0,
+                            1.2
+                        );
+                        results.push({ geometry: gridGeom, type: 'base', contourIndex: i, id: `dual-stamp-plate-${i}` });
+                    } else {
+                        const plateShape = new THREE.Shape(stampPlateContour);
+                        const plateGeom = new THREE.ExtrudeGeometry(plateShape, { depth: settings.baseHeight, bevelEnabled: false });
+                        results.push({ geometry: plateGeom, type: 'base', contourIndex: i, id: `dual-stamp-plate-${i}` });
+                    }
+
+                    const box = new THREE.Box2();
+                    stampPlateContour.forEach(p => box.expandByPoint(p));
+                    const center = new THREE.Vector2();
+                    box.getCenter(center);
+                    const size = new THREE.Vector2();
+                    box.getSize(size);
+
+                    const hThickness = settings.handleThickness;
+                    const hHeight = settings.handleHeight;
+
+                    const handleGeo = new THREE.BoxGeometry(hThickness, Math.min(size.y * 0.8, size.y - 4), hHeight);
+                    handleGeo.translate(center.x, center.y, settings.baseHeight + hHeight / 2);
+                    results.push({ geometry: handleGeo, type: 'handle', contourIndex: i, id: `dual-stamp-handle-${i}` });
+                }
+            }
+        }
+    });
+
+    // --- Post-Loop: Geometric Base (Global) ---
+    if (settings.outputType === 'keychain' && settings.keychainShape !== 'silhouette' && !hasManualBase) {
+        const center = globalCenter;
+
+        // V23: Dynamic Padding from Settings (default 4)
+        const padding = settings.keychainBasePadding ?? 4;
+
+        const minX = globalBox.min.x;
+        const maxX = globalBox.max.x;
+        const minY = globalBox.min.y;
+        const maxY = globalBox.max.y;
+
+        const contentWidth = maxX - minX;
+        const contentHeight = maxY - minY;
+        const halfW = (contentWidth / 2) + padding;
+        const halfH = (contentHeight / 2) + padding;
+
+        const maxHalf = Math.max(halfW, halfH);
+
+        // Shape Size (Radius for circle-likes, Half-Dim for rects)
+        const shapeSize = maxHalf + (settings.keychainHoleDiameter > 0 ? settings.keychainHoleDiameter / 2 : 0);
+
+        const baseShape = new THREE.Shape();
+
+        if (settings.keychainShape === 'circle') {
+            baseShape.absarc(center.x, center.y, shapeSize, 0, Math.PI * 2, false);
+
+        } else if (settings.keychainShape === 'square') {
+            // V23: "Square" is now "Rounded Rectangle" adapting to content aspect ratio
+            const r = 4; // Corner radius
+
+            const holeSpace = (settings.keychainHoleDiameter > 0 ? settings.keychainHoleDiameter + 2 : 0);
+
+            const x1 = minX - padding;
+            const x2 = maxX + padding;
+            const y1 = minY - padding;
+            const y2 = maxY + padding + holeSpace;
+
+            const bx = x1;
+            const by = y1;
+            const bw = x2 - x1;
+            const bh = y2 - y1;
+
+            baseShape.moveTo(bx + r, by);
+            baseShape.lineTo(bx + bw - r, by);
+            baseShape.quadraticCurveTo(bx + bw, by, bx + bw, by + r);
+            baseShape.lineTo(bx + bw, by + bh - r);
+            baseShape.quadraticCurveTo(bx + bw, by + bh, bx + bw - r, by + bh);
+            baseShape.lineTo(bx + r, by + bh);
+            baseShape.quadraticCurveTo(bx, by + bh, bx, by + bh - r);
+            baseShape.lineTo(bx, by + r);
+            baseShape.quadraticCurveTo(bx, by, bx + r, by);
+
+        } else if (settings.keychainShape === 'hexagon') {
+            const r = shapeSize;
+            for (let k = 0; k < 6; k++) {
+                const angle = (Math.PI / 3) * k + (Math.PI / 6);
+                const px = center.x + r * Math.cos(angle);
+                const py = center.y + r * Math.sin(angle);
+                if (k === 0) baseShape.moveTo(px, py);
+                else baseShape.lineTo(px, py);
+            }
+            baseShape.closePath();
+
+        } else if (settings.keychainShape === 'heart') {
+            const x = center.x;
+            const y = center.y - (shapeSize * 0.2);
+            const s = shapeSize * 0.035;
+            baseShape.moveTo(x, y + 10 * s);
+            baseShape.bezierCurveTo(x, y + 7 * s, x - 15 * s, y + 15 * s, x - 15 * s, y + 25 * s);
+            baseShape.bezierCurveTo(x - 15 * s, y + 35 * s, x, y + 30 * s, x, y + 50 * s);
+            baseShape.bezierCurveTo(x, y + 30 * s, x + 15 * s, y + 35 * s, x + 15 * s, y + 25 * s);
+            baseShape.bezierCurveTo(x + 15 * s, y + 15 * s, x, y + 7 * s, x, y + 10 * s);
+        }
+
+        // Hole
+        if (settings.keychainHoleDiameter > 0) {
+            const holeR = settings.keychainHoleDiameter / 2;
+            const holePath = new THREE.Path();
+
+            let defaultHoleX = center.x;
+            let defaultHoleY = center.y + shapeSize - holeR - 3; // Circle default
+
+            if (settings.keychainShape === 'square') {
+                const topY = maxY + padding + (settings.keychainHoleDiameter + 2);
+                defaultHoleY = topY - holeR - 3;
+                defaultHoleX = center.x;
+            } else if (settings.keychainShape === 'hexagon') {
+                defaultHoleY = center.y + (shapeSize * Math.sin(Math.PI / 2)) - holeR - 3;
+            }
+
+            // Apply User Offset
+            const userOffsetX = settings.keychainHoleOffset?.x || 0;
+            const userOffsetY = settings.keychainHoleOffset?.y || 0;
+
+            holePath.absarc(defaultHoleX + userOffsetX, defaultHoleY + userOffsetY, holeR, 0, Math.PI * 2, true);
+            baseShape.holes.push(holePath);
+        }
+
+        const baseGeom = new THREE.ExtrudeGeometry(baseShape, {
+            depth: settings.baseHeight,
+            bevelEnabled: !!settings.keychainBevelEnabled,
+            bevelThickness: settings.keychainBevelSize || 0,
+            bevelSize: settings.keychainBevelSize || 0,
+            bevelSegments: 3
+        });
+        results.push({ geometry: baseGeom, type: 'base', contourIndex: -1, id: `keychain-base-global` });
+    }
+
+    // --- Post-Loop: V19 Keychain Solid Relief ---
+    if (settings.outputType === 'keychain') {
+        const rootNodes = buildContourHierarchy(processedContours);
+
+        const processNodeForRelief = (node: ContourNode) => {
+            // We want to fill "Positive" spaces.
+            // Depth 0 = Solid (e.g. Letter 'O' outer)
+            // Depth 1 = Hole (e.g. Letter 'O' inner)
+            // Depth 2 = Solid (e.g. Island inside hole)
+
+            if (node.depth % 2 === 0) {
+                const shape = new THREE.Shape(node.contour);
+
+                // Add holes from immediate children
+                node.children.forEach(child => {
+                    const holePath = new THREE.Path();
+                    holePath.setFromPoints(child.contour);
+                    shape.holes.push(holePath);
+                });
+
+                const reliefHeight = settings.markerHeight;
+                const reliefGeom = new THREE.ExtrudeGeometry(shape, {
+                    depth: reliefHeight,
+                    bevelEnabled: false
+                });
+
+                // Sit on top of base
+                reliefGeom.translate(0, 0, settings.baseHeight);
+                results.push({ geometry: reliefGeom, type: 'inner', contourIndex: node.id, id: `keychain-solid-relief-${node.id}` });
+            }
+
+            // Recurse
+            node.children.forEach(processNodeForRelief);
+        };
+
+        rootNodes.forEach(processNodeForRelief);
+    }
+
+    return results;
+};
+
+export const exportToSTL = (parts: CutterPart[], hiddenIds?: Set<string>): Blob => {
+    const exporter = new STLExporter();
+
+    // Filter hidden parts
+    const visibleParts = hiddenIds ? parts.filter(p => !hiddenIds.has(p.id)) : parts;
+
+    const geometries = visibleParts.map(p => {
+        let g = p.geometry.clone();
+        if (g.attributes.uv) g.deleteAttribute('uv');
+        if (g.attributes.color) g.deleteAttribute('color');
+        if (g.index) g = g.toNonIndexed();
+        return g;
+    });
+
+    if (geometries.length === 0) return new Blob([]);
+
+    const merged = mergeGeometries(geometries, false);
+    if (!merged) return new Blob([]);
+
+    const result = exporter.parse(new THREE.Mesh(merged), { binary: true });
     return new Blob([result as any], { type: 'application/octet-stream' });
 };

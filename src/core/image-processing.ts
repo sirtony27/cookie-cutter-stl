@@ -20,18 +20,25 @@ export const loadImage = (file: File): Promise<HTMLImageElement> => {
     });
 };
 
+// V16: Smart Trace Options
+export interface ProcessOptions {
+    blur: number;       // 0-10 (px)
+    threshold: number;  // 0-255
+    invert: boolean;
+}
+
 export const processImage = (
     image: HTMLImageElement,
-    threshold: number = 128,
-    invert: boolean = false
+    options: ProcessOptions
 ): TraceResult => {
+    const { blur, threshold, invert } = options;
     const canvas = document.createElement('canvas');
     const ctx = canvas.getContext('2d');
     if (!ctx) throw new Error('Could not get 2d context');
 
     // Resize for performance/consistency if needed, but keeping original resolution for now
     // or capping max dimension to avoid huge processing costs.
-    const MAX_DIM = 512;
+    const MAX_DIM = 1024; // Increased for better detail if needed
     let width = image.width;
     let height = image.height;
 
@@ -44,18 +51,17 @@ export const processImage = (
     canvas.width = width;
     canvas.height = height;
 
-    // Gaussian Blur (Simple 3x3 box blur approximate or real Gaussian)
-    // For better quality on client side without heavy libraries, we can do a simple multi-pass box blur or a convolution.
-    // Let's do a simple 3x3 convolution for smoothing before thresholding.
-    // Actually, standard canvas filter 'blur' is available! 
-    ctx.filter = 'blur(2px)'; // Smoothing input
+    // 1. Apply Filtering (Blur)
+    if (blur > 0) {
+        ctx.filter = `blur(${blur}px)`;
+    }
     ctx.drawImage(image, 0, 0, width, height);
     ctx.filter = 'none'; // Reset
 
     const imageData = ctx.getImageData(0, 0, width, height);
     const data = imageData.data;
 
-    // Binary grid
+    // 2. Binary Grid Generation (Thresholding)
     const grid: number[][] = [];
     for (let y = 0; y < height; y++) {
         const row: number[] = [];
@@ -72,9 +78,21 @@ export const processImage = (
                 continue;
             }
 
-            const luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            const luma = 0.299 * r + 0.587 * g + 0.114 * b; // CCIR 601
+
+            // Invert logic: 
+            // Standard: Dark = 1 (Solid), Light = 0 (Empty) -> For drawing on white paper
+            // Invert checked: Light = 1, Dark = 0 -> For white chalk on blackboard
+
+            // Default (invert=false should be standard drawing trace):
+            // Luma < Threshold => Dark => Solid (1)
+
             let val = luma < threshold ? 1 : 0;
-            if (invert) val = 1 - val;
+
+            if (invert) {
+                // Invert means we want Light areas to be Solid
+                val = 1 - val;
+            }
 
             row.push(val);
         }
