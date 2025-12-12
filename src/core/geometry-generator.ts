@@ -1,6 +1,8 @@
 import * as THREE from 'three';
 import { STLExporter } from 'three-stdlib';
 
+import { diffContours } from './boolean-ops'; // Import Diff logic
+
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 
 export interface CutterSettings {
@@ -44,13 +46,16 @@ export interface CutterSettings {
     keychainBevelSize?: number;
 }
 
-export type PartType = 'base' | 'outer' | 'inner' | 'handle' | 'bridge';
+export type ShapeType = 'standard' | 'rounded' | 'hexagon' | 'heart' | 'circle';
+export type PartType = 'base' | 'inner' | 'outer' | 'handle' | 'bridge'; // Added 'bridge'
 
 export interface CutterPart {
     geometry: THREE.BufferGeometry;
     type: PartType;
     contourIndex: number; // Index in the original contours array (or distinct ID)
     id: string; // Unique ID for React keys
+    position?: [number, number, number]; // Position offset for rendering
+    center?: THREE.Vector2; // Original center of the part
 }
 
 // Check if contour A is inside contour B
@@ -469,10 +474,16 @@ const createSteppedWall = (
     return createTaperedWall(contour, zStart, heights, botTs, topTs);
 };
 
+// Helper to determine if a contour is an outer boundary or a hole
+// This is a simplified heuristic based on winding order or point-in-polygon
+// For robust hole detection, a full hierarchy build is better.
+// Helper to determine if a contour is an outer boundary or a hole (Unused export for now, but good to keep or remove)
+// Removed unused isOuterContour to fix lint
+
 
 export const generateGeometry = (
     contours: THREE.Vector2[][], // Raw pixel coordinates
-    roles: ('cut' | 'stamp' | 'auto' | 'base')[] | undefined,
+    roles: ('cut' | 'stamp' | 'auto' | 'base' | 'void')[] | undefined, // Added 'void' role
     imgWidth: number,
     imgHeight: number,
     settings: CutterSettings
@@ -487,7 +498,7 @@ export const generateGeometry = (
     // Keychain = Normal (readable)
     const shouldMirror = settings.outputType === 'cutter' || settings.mirror;
 
-    const processedContours = contours.map(contour => {
+    const processedRawContours = contours.map(contour => {
         return contour.map(p => {
             return new THREE.Vector2(
                 shouldMirror ? (offsetX - p.x) * scale : (p.x - offsetX) * scale,
@@ -496,10 +507,65 @@ export const generateGeometry = (
         });
     });
 
-    if (processedContours.length === 0) return [];
+    if (processedRawContours.length === 0) return [];
 
-    // 2. Classify Contours
-    let largestIndex = 0;
+    // 0. Pre-process Contours: Separate Solids and Voids (Holes)
+    const solidContours: THREE.Vector2[][] = [];
+    const voidContours: THREE.Vector2[][] = [];
+    const solidIndices: number[] = []; // Map back to original index for selection
+
+    processedRawContours.forEach((contour, i) => {
+        if (roles && roles[i] === 'void') {
+            voidContours.push(contour);
+        } else {
+            solidContours.push(contour);
+            solidIndices.push(i);
+        }
+    });
+
+    // Apply Boolean Difference if there are voids
+    let finalProcessedParts: { points: THREE.Vector2[], originIdx: number }[] = [];
+
+    if (voidContours.length > 0) {
+        // Note: This simple implementation subtracts ALL voids from EACH solid.
+        // Ideally, we'd only subtract overlapping ones, but diffContours handles non-overlaps efficiently (no-op).
+        // However, diffContours(A, B) returns (A - B).
+        // If we have multiple solids, we process each.
+
+        // This mapping is tricky for Selection sync.
+        // If Solid A (index 0) gets cut in half, we have A1 and A2. Both should select index 0.
+
+        solidContours.forEach((solid, idx) => {
+            let currentSolids = [solid];
+
+            voidContours.forEach(voidShape => {
+                // Subtract voidShape from all currentSolids
+                const nextPass: THREE.Vector2[][] = [];
+                currentSolids.forEach(s => {
+                    const res = diffContours(s, voidShape); // Returns array of polygons
+                    nextPass.push(...res);
+                });
+                currentSolids = nextPass;
+            });
+
+            // Add results
+            currentSolids.forEach(c => {
+                finalProcessedParts.push({ points: c, originIdx: solidIndices[idx] });
+            });
+        });
+    } else {
+        // If no voids, all processedRawContours are solids
+        processedRawContours.forEach((c, i) => {
+            finalProcessedParts.push({ points: c, originIdx: i });
+        });
+    }
+
+    // Compatibility shim: Many downstream functions expect 'processedContours'
+    const processedContours = finalProcessedParts.map(p => p.points);
+    const originIndices = finalProcessedParts.map(p => p.originIdx);
+
+    // 2. Classify Contours (now iterating over finalProcessedParts)
+    let largestIndex = 0; // This will now refer to an index in finalProcessedParts
     let maxLen = 0;
     processedContours.forEach((c, i) => {
         const len = c.length;
@@ -510,39 +576,59 @@ export const generateGeometry = (
     });
 
     const finalTypes = processedContours.map((_, i) => {
-        const role = roles ? roles[i] : 'auto';
+        const originalIdx = originIndices[i];
+        const role = roles ? roles[originalIdx] : 'auto';
         if (role === 'cut') return 'outer';
         if (role === 'stamp') return 'inner';
-        return i === largestIndex ? 'outer' : 'inner'; // Auto heuristic
+        if (role === 'base') return 'base';
+        return i === largestIndex ? 'outer' : 'inner'; // Auto heuristic on the *processed* parts
     });
 
     const results: CutterPart[] = [];
 
     // --- Automatic Bridges ---
     if (settings.automaticBridges) {
-        const areas = processedContours.map(THREE.ShapeUtils.area);
-        const sortedIndices = processedContours.map((_, i) => i).sort((a, b) => Math.abs(areas[a]) - Math.abs(areas[b]));
+        // For bridges, we need to consider the original contours and their hierarchy
+        // This part needs to be adapted to work with the boolean-processed contours
+        // For simplicity, let's apply bridges to the *original* outer contours
+        // and then merge them. This might need more sophisticated logic if bridges
+        // should respect the boolean cuts.
+        // For now, we'll use the original processedRawContours for bridge calculation
+        // and assign them to the closest original index.
+
+        const originalAreas = processedRawContours.map(THREE.ShapeUtils.area);
+        const sortedOriginalIndices = processedRawContours.map((_, i) => i).sort((a, b) => Math.abs(originalAreas[a]) - Math.abs(originalAreas[b]));
         const parentMap = new Map<number, number>();
 
-        for (let i = 0; i < sortedIndices.length; i++) {
-            const childIdx = sortedIndices[i];
+        for (let i = 0; i < sortedOriginalIndices.length; i++) {
+            const childIdx = sortedOriginalIndices[i];
+            const originalRole = roles ? roles[childIdx] : 'auto';
 
-            if (finalTypes[childIdx] === 'outer' && !settings.automaticBridges) continue;
+            // Only consider 'outer' or 'auto' contours that are not 'void' for bridge parents
+            if (originalRole === 'void' || (originalRole === 'stamp' && !settings.automaticBridges)) continue;
 
-            const childC = processedContours[childIdx];
+            const childC = processedRawContours[childIdx];
             let bestParent = -1;
             let minParentArea = Infinity;
 
-            for (let j = i + 1; j < sortedIndices.length; j++) {
-                const parentIdx = sortedIndices[j];
-                const parentC = processedContours[parentIdx];
+            for (let j = i + 1; j < sortedOriginalIndices.length; j++) {
+                const parentIdx = sortedOriginalIndices[j];
+                const parentC = processedRawContours[parentIdx];
+                const parentRole = roles ? roles[parentIdx] : 'auto';
 
+                if (parentRole === 'void') continue; // Voids cannot be parents
+
+                // Only consider 'outer' or 'auto' (which might become inner/outer) for bridge parents.
+                // We should avoid connecting to something that is explicitly 'stamp' if we are 'outer'.
+                // But for now, just avoid voids.
+
+                // Test first point of current
                 if (isPointInPolygon2D(childC[0], parentC)) {
-                    const pArea = Math.abs(areas[parentIdx]);
+                    const pArea = Math.abs(originalAreas[parentIdx]);
                     if (pArea < minParentArea) {
                         minParentArea = pArea;
                         bestParent = parentIdx;
-                        break;
+                        // No break here, we want the *smallest* enclosing parent
                     }
                 }
             }
@@ -550,8 +636,8 @@ export const generateGeometry = (
         }
 
         parentMap.forEach((parentIdx, childIdx) => {
-            const childC = processedContours[childIdx];
-            const parentC = processedContours[parentIdx];
+            const childC = processedRawContours[childIdx];
+            const parentC = processedRawContours[parentIdx];
             let minDistSq = Infinity;
             let pChild = new THREE.Vector2();
             let pParent = new THREE.Vector2();
@@ -586,7 +672,7 @@ export const generateGeometry = (
             results.push({
                 geometry,
                 type: 'bridge',
-                contourIndex: childIdx,
+                contourIndex: childIdx, // Use original child index
                 id: `bridge-${childIdx}-${parentIdx}`
             });
         });
@@ -636,12 +722,17 @@ export const generateGeometry = (
                     const outerRadius = (settings.keychainHoleDiameter / 2) + 2;
                     const innerRadius = settings.keychainHoleDiameter / 2;
 
+                    const holeOffsetX = settings.keychainHoleOffset?.x || 0;
+                    const holeOffsetY = settings.keychainHoleOffset?.y || 0;
+
                     const tabShape = new THREE.Shape();
-                    const centerY = topCenter.y - 1;
-                    tabShape.absarc(topCenter.x, centerY, outerRadius, 0, Math.PI * 2, false);
+                    const centerX = topCenter.x + holeOffsetX;
+                    const centerY = (topCenter.y - 1) + holeOffsetY;
+
+                    tabShape.absarc(centerX, centerY, outerRadius, 0, Math.PI * 2, false);
 
                     const holePath = new THREE.Path();
-                    holePath.absarc(topCenter.x, centerY, innerRadius, 0, Math.PI * 2, true);
+                    holePath.absarc(centerX, centerY, innerRadius, 0, Math.PI * 2, true);
                     tabShape.holes.push(holePath);
 
                     const tabGeom = new THREE.ExtrudeGeometry(tabShape, {
@@ -709,6 +800,8 @@ export const generateGeometry = (
                     }
                 }
 
+
+                // Cutter Wall
                 let cutterWall: THREE.BufferGeometry;
                 if (settings.bladeProfile === 'stepped') {
                     const tipH = 1.0;
@@ -719,11 +812,41 @@ export const generateGeometry = (
                     cutterWall = createExtrudedWall(contour, settings.cutterHeight, settings.cutterThickness, 0);
                 }
 
-                results.push({ geometry: cutterWall, type: 'outer', contourIndex: i, id: `wall-${i}` });
+                // Center geometry
+                const box = new THREE.Box2();
+                contour.forEach(p => box.expandByPoint(p));
+                const center = new THREE.Vector2();
+                box.getCenter(center);
+
+                cutterWall.translate(-center.x, -center.y, 0);
+
+                results.push({
+                    geometry: cutterWall,
+                    type: 'outer',
+                    contourIndex: i,
+                    id: `wall-${i}`,
+                    position: [center.x, center.y, 0],
+                    center: center
+                });
 
             } else {
                 const markerWall = createExtrudedWall(contour, settings.markerHeight, settings.markerThickness, 0);
-                results.push({ geometry: markerWall, type: 'inner', contourIndex: i, id: `marker-${i}` });
+
+                const box = new THREE.Box2();
+                contour.forEach(p => box.expandByPoint(p));
+                const center = new THREE.Vector2();
+                box.getCenter(center);
+
+                markerWall.translate(-center.x, -center.y, 0);
+
+                results.push({
+                    geometry: markerWall,
+                    type: 'inner',
+                    contourIndex: i,
+                    id: `marker-${i}`,
+                    position: [center.x, center.y, 0],
+                    center: center
+                });
             }
 
         } else if (settings.generationMode === 'dual') {
@@ -737,16 +860,63 @@ export const generateGeometry = (
                 } else {
                     cutterWall = createExtrudedWall(contour, settings.cutterHeight, settings.cutterThickness, 0);
                 }
-                results.push({ geometry: cutterWall, type: 'outer', contourIndex: i, id: `dual-cut-${i}` });
+                // Center geometry
+                const box = new THREE.Box2();
+                contour.forEach(p => box.expandByPoint(p));
+                const center = new THREE.Vector2();
+                box.getCenter(center);
+
+                cutterWall.translate(-center.x, -center.y, 0);
+
+                results.push({
+                    geometry: cutterWall,
+                    type: 'outer',
+                    contourIndex: i,
+                    id: `dual-cut-${i}`,
+                    position: [center.x, center.y, 0],
+                    center: center
+                });
 
                 if (settings.withBase) {
                     if (settings.solidBase) {
                         const shape = new THREE.Shape(contour);
                         const baseGeom = new THREE.ExtrudeGeometry(shape, { depth: settings.baseHeight, bevelEnabled: false });
-                        results.push({ geometry: baseGeom, type: 'base', contourIndex: i, id: `dual-cut-base-${i}` });
+
+                        // Center geometry
+                        const box = new THREE.Box2();
+                        contour.forEach(p => box.expandByPoint(p));
+                        const center = new THREE.Vector2();
+                        box.getCenter(center);
+
+                        baseGeom.translate(-center.x, -center.y, 0);
+
+                        results.push({
+                            geometry: baseGeom,
+                            type: 'base',
+                            contourIndex: i,
+                            id: `dual-cut-base-${i}`,
+                            position: [center.x, center.y, 0],
+                            center: center
+                        });
                     } else {
                         const baseWall = createExtrudedWall(contour, settings.baseHeight, settings.baseThickness, 0);
-                        results.push({ geometry: baseWall, type: 'base', contourIndex: i, id: `dual-cut-base-${i}` });
+
+                        // Center geometry
+                        const box = new THREE.Box2();
+                        contour.forEach(p => box.expandByPoint(p));
+                        const center = new THREE.Vector2();
+                        box.getCenter(center);
+
+                        baseWall.translate(-center.x, -center.y, 0);
+
+                        results.push({
+                            geometry: baseWall,
+                            type: 'base',
+                            contourIndex: i,
+                            id: `dual-cut-base-${i}`,
+                            position: [center.x, center.y, 0],
+                            center: center
+                        });
                     }
                 }
 
@@ -762,11 +932,43 @@ export const generateGeometry = (
                             4.0,
                             1.2
                         );
-                        results.push({ geometry: gridGeom, type: 'base', contourIndex: i, id: `dual-stamp-plate-${i}` });
+
+                        // Center geometry
+                        const box = new THREE.Box2();
+                        stampPlateContour.forEach(p => box.expandByPoint(p));
+                        const center = new THREE.Vector2();
+                        box.getCenter(center);
+
+                        gridGeom.translate(-center.x, -center.y, 0);
+
+                        results.push({
+                            geometry: gridGeom,
+                            type: 'base',
+                            contourIndex: i,
+                            id: `dual-stamp-plate-${i}`,
+                            position: [center.x, center.y, 0],
+                            center: center
+                        });
                     } else {
                         const plateShape = new THREE.Shape(stampPlateContour);
                         const plateGeom = new THREE.ExtrudeGeometry(plateShape, { depth: settings.baseHeight, bevelEnabled: false });
-                        results.push({ geometry: plateGeom, type: 'base', contourIndex: i, id: `dual-stamp-plate-${i}` });
+
+                        // Center geometry
+                        const box = new THREE.Box2();
+                        stampPlateContour.forEach(p => box.expandByPoint(p));
+                        const center = new THREE.Vector2();
+                        box.getCenter(center);
+
+                        plateGeom.translate(-center.x, -center.y, 0);
+
+                        results.push({
+                            geometry: plateGeom,
+                            type: 'base',
+                            contourIndex: i,
+                            id: `dual-stamp-plate-${i}`,
+                            position: [center.x, center.y, 0],
+                            center: center
+                        });
                     }
 
                     const box = new THREE.Box2();
@@ -945,6 +1147,15 @@ export const exportToSTL = (parts: CutterPart[], hiddenIds?: Set<string>): Blob 
 
     const geometries = visibleParts.map(p => {
         let g = p.geometry.clone();
+
+        // V36.2: Fix Export Position
+        // Recently we started centering parts in `generateGeometry` and storing the offset in `p.position`.
+        // The geometry itself was translated to (0,0) LOCAL.
+        // We must re-apply the global position for the STL export to match the Viewer3D.
+        if (p.position) {
+            g.translate(p.position[0], p.position[1], p.position[2]);
+        }
+
         if (g.attributes.uv) g.deleteAttribute('uv');
         if (g.attributes.color) g.deleteAttribute('color');
         if (g.index) g = g.toNonIndexed();

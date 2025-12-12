@@ -12,6 +12,7 @@ export function ImageProcessor({ imageSrc, onConfirm, onCancel }: ImageProcessor
     const [blur, setBlur] = useState(2);
     const [threshold, setThreshold] = useState(128);
     const [invert, setInvert] = useState(false);
+    const [detectionMode, setDetectionMode] = useState<'standard' | 'text'>('standard');
 
     const canvasRef = useRef<HTMLCanvasElement>(null);
     const imgRef = useRef<HTMLImageElement>(null);
@@ -145,6 +146,31 @@ export function ImageProcessor({ imageSrc, onConfirm, onCancel }: ImageProcessor
                     />
                 </div>
 
+                {/* V39: Detection Mode Selector */}
+                <div className="space-y-2">
+                    <span className="text-xs font-bold uppercase tracking-wider text-gray-400">Modo de Detección</span>
+                    <div className="flex bg-black/40 p-1 rounded-lg border border-white/10">
+                        <button
+                            onClick={() => { setDetectionMode('standard'); setThreshold(128); setBlur(2); }}
+                            className={`flex-1 py-2 rounded-md text-xs font-medium transition-all ${detectionMode === 'standard' ? 'bg-blue-600 text-white shadow' : 'text-gray-400 hover:text-white'}`}
+                        >
+                            Logos / Personajes
+                        </button>
+                        <button
+                            onClick={() => { setDetectionMode('text'); setThreshold(128); setBlur(0); }} // Text needs less blur
+                            className={`flex-1 py-2 rounded-md text-xs font-medium transition-all ${detectionMode === 'text' ? 'bg-purple-600 text-white shadow' : 'text-gray-400 hover:text-white'}`}
+                        >
+                            Texto Avanzado
+                        </button>
+                    </div>
+
+                    {detectionMode === 'text' && (
+                        <div className="text-[10px] text-purple-300 bg-purple-500/10 p-2 rounded border border-purple-500/20">
+                            Mejora para fuentes pequeñas y tipografías complejas.
+                        </div>
+                    )}
+                </div>
+
                 {/* Invert */}
                 <div className="flex items-center justify-between p-3 bg-white/5 rounded-lg border border-white/5 cursor-pointer hover:bg-white/10 transition-colors" onClick={() => setInvert(!invert)}>
                     <span className="text-sm font-medium text-gray-300">Invertir Colores</span>
@@ -162,14 +188,22 @@ export function ImageProcessor({ imageSrc, onConfirm, onCancel }: ImageProcessor
                         Cancelar
                     </button>
                     <button
-                        onClick={() => onConfirm({ blur, threshold, invert })}
+                        onClick={() => onConfirm({
+                            blur,
+                            threshold,
+                            invert,
+                            mode: 'luminance',
+                            highRes: true,
+                            adaptive: detectionMode === 'text',
+                            morphology: detectionMode === 'text'
+                        })}
                         className="flex-[2] py-3 rounded-xl font-bold bg-blue-600 text-white hover:bg-blue-500 shadow-lg shadow-blue-900/40 transition-all transform active:scale-95 flex items-center justify-center gap-2"
                     >
                         <Wand2 className="w-4 h-4" />
                         Trazar Modelo
                     </button>
                 </div>
-            </div>
-        </div>
+            </div >
+        </div >
     );
 }

@@ -27,19 +27,36 @@ export interface ProcessOptions {
     invert: boolean;
     mode: 'luminance' | 'edges'; // V32: Detection Mode
     highRes: boolean;            // V32: High Resolution Mode
+    // V39: Advanced Text Detection
+    adaptive: boolean;           // Use adaptive thresholding
+    morphology: boolean;         // Use morphological closing (repair text)
 }
 
-export const processImage = (
-    image: HTMLImageElement,
-    options: ProcessOptions
-): TraceResult => {
-    const { blur, threshold, invert, mode, highRes } = options;
-    const canvas = document.createElement('canvas');
-    const ctx = canvas.getContext('2d');
-    if (!ctx) throw new Error('Could not get 2d context');
+// Helper: Integral Image for fast local mean
+const computeIntegralImage = (data: Uint8ClampedArray, width: number, height: number) => {
+    const integral = new Int32Array(width * height);
+    for (let y = 0; y < height; y++) {
+        let sum = 0;
+        for (let x = 0; x < width; x++) {
+            const idx = (y * width + x) * 4;
+            // Grayscale
+            const val = 0.299 * data[idx] + 0.587 * data[idx + 1] + 0.114 * data[idx + 2];
+            sum += val;
+            if (y === 0) {
+                integral[y * width + x] = sum;
+            } else {
+                integral[y * width + x] = sum + integral[(y - 1) * width + x];
+            }
+        }
+    }
+    return integral;
+};
 
-    // V32: High Res Mode (up to 2500px for sharp text/logos)
-    const MAX_DIM = highRes ? 2500 : 1024;
+
+// Helper to prepare image data (Main Thread Only)
+export const prepareImageForTrace = (image: HTMLImageElement, options: ProcessOptions) => {
+    const { highRes, blur } = options;
+    const MAX_DIM = highRes ? 2500 : 1024; // V32: High Res Mode
     let width = image.width;
     let height = image.height;
 
@@ -49,42 +66,102 @@ export const processImage = (
         height = Math.round(height * ratio);
     }
 
+    const canvas = document.createElement('canvas');
     canvas.width = width;
     canvas.height = height;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) throw new Error('Could not get 2d context');
 
-    // 1. Apply Filtering (Blur)
+    // Apply Filtering (Blur)
     if (blur > 0) {
         ctx.filter = `blur(${blur}px)`;
     }
     ctx.drawImage(image, 0, 0, width, height);
-    ctx.filter = 'none'; // Reset
-
     const imageData = ctx.getImageData(0, 0, width, height);
-    const data = imageData.data;
 
-    const grid: number[][] = [];
+    return {
+        imageData,
+        meta: { originalWidth: image.width, originalHeight: image.height }
+    };
+}
 
-    // V32: Sobel Edge Detection
-    if (mode === 'edges') {
+export const processImage = (
+    image: HTMLImageElement,
+    options: ProcessOptions
+): TraceResult => {
+    // Synchronous fallback (uses prepare + process)
+    const { imageData, meta } = prepareImageForTrace(image, options);
+    return processImageData(imageData, options, meta);
+};
+
+// Pure logic function (Worker Friendly)
+export const processImageData = (
+    imageData: ImageData,
+    options: ProcessOptions,
+    meta: { originalWidth: number, originalHeight: number }
+): TraceResult => {
+    const { threshold, invert, mode, adaptive, morphology } = options;
+    const { width, height } = imageData;
+    const data = imageData.data; // Uint8ClampedArray
+
+    // Note: Blur was previously done via Context2D filter.
+    // Inside worker we cannot use Context2D.
+    // If we move to worker, we must implement Gaussian Blur manually or accept that blur happens on main thread before sending?
+    // Doing blur on Main Thread (via canvas filter) is FAST (GPU/Browser native). Doing manual blur in JS is slow.
+    // DECISION: Perform Blur in 'prepare' step (Main Thread) before getting ImageData.
+
+    // ... The rest of the logic ...
+
+    let grid: number[][] = [];
+
+    // V39: Standard vs Adaptive
+    if (adaptive) {
+        // [Logic preserved from original]
+        const integral = computeIntegralImage(data, width, height);
+        const S = Math.round(width / 20);
+        const s2 = Math.floor(S / 2);
+        const T = 0.15;
+
+        for (let y = 0; y < height; y++) {
+            const row: number[] = [];
+            for (let x = 0; x < width; x++) {
+                const x1 = x - s2;
+                const x2 = x + s2;
+                const y1 = y - s2;
+                const y2 = y + s2;
+
+                const count = (Math.min(x2, width - 1) - Math.max(0, x1) + 1) * (Math.min(y2, height - 1) - Math.max(0, y1) + 1);
+
+                // Helper inline (since getIntegralSum needs height which I didn't pass, oops)
+                const X1 = Math.max(0, x1);
+                const Y1 = Math.max(0, y1);
+                const X2 = Math.min(width - 1, x2);
+                const Y2 = Math.min(height - 1, y2);
+
+                const valA = (X1 > 0 && Y1 > 0) ? integral[(Y1 - 1) * width + (X1 - 1)] : 0;
+                const valB = (Y1 > 0) ? integral[(Y1 - 1) * width + X2] : 0;
+                const valC = (X1 > 0) ? integral[Y2 * width + (X1 - 1)] : 0;
+                const valD = integral[Y2 * width + X2];
+
+                const sum = valD - valB - valC + valA;
+                const mean = sum / count;
+
+                const idx = (y * width + x) * 4;
+                const pxVal = 0.299 * data[idx] + 0.587 * data[idx + 1] + 0.114 * data[idx + 2];
+
+                let val = pxVal < (mean * (1 - T)) ? 1 : 0;
+                if (invert) val = 1 - val;
+                row.push(val);
+            }
+            grid.push(row);
+        }
+    } else if (mode === 'edges') {
+        // [Logic preserved]
         const gray = new Uint8Array(width * height);
-
-        // Convert to Grayscale first
         for (let i = 0; i < width * height; i++) {
             const idx = i * 4;
-            // CCIR 601
             gray[i] = 0.299 * data[idx] + 0.587 * data[idx + 1] + 0.114 * data[idx + 2];
         }
-
-        const sobelData = new Uint8Array(width * height);
-
-        // Sobel Kernels
-        // Gx: [-1 0 1]
-        //     [-2 0 2]
-        //     [-1 0 1]
-        // Gy: [-1 -2 -1]
-        //     [ 0  0  0]
-        //     [ 1  2  1]
-
         for (let y = 0; y < height; y++) {
             const row: number[] = [];
             for (let x = 0; x < width; x++) {
@@ -92,70 +169,68 @@ export const processImage = (
                     row.push(0);
                     continue;
                 }
-
-                // Gx
-                const gx =
-                    (-1 * gray[(y - 1) * width + (x - 1)]) + (0 * gray[(y - 1) * width + x]) + (1 * gray[(y - 1) * width + (x + 1)]) +
-                    (-2 * gray[y * width + (x - 1)]) + (0 * gray[y * width + x]) + (2 * gray[y * width + (x + 1)]) +
-                    (-1 * gray[(y + 1) * width + (x - 1)]) + (0 * gray[(y + 1) * width + x]) + (1 * gray[(y + 1) * width + (x + 1)]);
-
-                // Gy
-                const gy =
-                    (-1 * gray[(y - 1) * width + (x - 1)]) + (-2 * gray[(y - 1) * width + x]) + (-1 * gray[(y - 1) * width + (x + 1)]) +
-                    (0 * gray[y * width + (x - 1)]) + (0 * gray[y * width + x]) + (0 * gray[y * width + (x + 1)]) +
+                const gx = (-1 * gray[(y - 1) * width + (x - 1)]) + (1 * gray[(y - 1) * width + (x + 1)]) +
+                    (-2 * gray[y * width + (x - 1)]) + (2 * gray[y * width + (x + 1)]) +
+                    (-1 * gray[(y + 1) * width + (x - 1)]) + (1 * gray[(y + 1) * width + (x + 1)]);
+                const gy = (-1 * gray[(y - 1) * width + (x - 1)]) + (-2 * gray[(y - 1) * width + x]) + (-1 * gray[(y - 1) * width + (x + 1)]) +
                     (1 * gray[(y + 1) * width + (x - 1)]) + (2 * gray[(y + 1) * width + x]) + (1 * gray[(y + 1) * width + (x + 1)]);
-
                 const mag = Math.sqrt(gx * gx + gy * gy);
-
-                // Edge Thresholding
-                // Mag > threshold => Edge (1)
-                // Invert? Usually Edges are 1 (Solid). 
-                // If Invert is checked, maybe we want Non-Edges? Rare, but logic applies.
-
                 let val = mag > threshold ? 1 : 0;
-
                 if (invert) val = 1 - val;
-
                 row.push(val);
             }
             grid.push(row);
         }
-
     } else {
-        // Standard Luminance Threshold
+        // Standard Luminance
         for (let y = 0; y < height; y++) {
             const row: number[] = [];
             for (let x = 0; x < width; x++) {
                 const idx = (y * width + x) * 4;
-                const r = data[idx];
-                const g = data[idx + 1];
-                const b = data[idx + 2];
                 const a = data[idx + 3];
-
                 if (a < 50) {
-                    row.push(0); // Transparent
+                    row.push(0);
                     continue;
                 }
-
-                const luma = 0.299 * r + 0.587 * g + 0.114 * b;
-
-                // Luma < Threshold => Dark => Solid (1)
+                const luma = 0.299 * data[idx] + 0.587 * data[idx + 1] + 0.114 * data[idx + 2];
                 let val = luma < threshold ? 1 : 0;
-
                 if (invert) val = 1 - val;
-
                 row.push(val);
             }
             grid.push(row);
         }
     }
 
+    // Morphology
+    if (morphology) {
+        // [Logic preserved]
+        let dilated = grid.map(row => [...row]);
+        for (let y = 1; y < height - 1; y++) {
+            for (let x = 1; x < width - 1; x++) {
+                if (grid[y][x] === 1) {
+                    dilated[y - 1][x] = 1; dilated[y + 1][x] = 1;
+                    dilated[y][x - 1] = 1; dilated[y][x + 1] = 1;
+                }
+            }
+        }
+        let closed = dilated.map(row => [...row]);
+        for (let y = 1; y < height - 1; y++) {
+            for (let x = 1; x < width - 1; x++) {
+                if (dilated[y][x] === 1) {
+                    if (dilated[y - 1][x] === 0 || dilated[y + 1][x] === 0 ||
+                        dilated[y][x - 1] === 0 || dilated[y][x + 1] === 0) {
+                        closed[y][x] = 0;
+                    }
+                }
+            }
+        }
+        grid = closed;
+    }
+
     const contours = extractContours(grid, width, height);
 
-    // V27: Map contours back to original image space if resizing occurred
-    const originalWidth = image.width;
-    const originalHeight = image.height;
-
+    // Resizing logic
+    const { originalWidth, originalHeight } = meta;
     if (width !== originalWidth || height !== originalHeight) {
         const scaleX = originalWidth / width;
         const scaleY = originalHeight / height;
@@ -263,7 +338,7 @@ const traceBoundary = (
     // Let's just find *any* 0 neighbor to serve as "from" direction.
     // Standard: Backtrack is West (6).
 
-    contour.push(new THREE.Vector2(x, -y));
+    contour.push(new THREE.Vector2(x, y));
     visited.add(`${x},${y}`);
 
     let currentX = x;
@@ -293,7 +368,7 @@ const traceBoundary = (
                 // Found next boundary point
                 currentX = nx;
                 currentY = ny;
-                contour.push(new THREE.Vector2(currentX, -currentY));
+                contour.push(new THREE.Vector2(currentX, currentY));
                 visited.add(`${currentX},${currentY}`);
 
                 // New backtrack direction is the opposite of the direction we just moved
@@ -337,8 +412,19 @@ const traceBoundary = (
         }
     }
 
-    // Simplification (Ramer-Douglas-Peucker) could be applied here if distinct points are too many
-    return simplifyContour(contour, 1.0);
+    // V39: Smart Simplification
+    // Small detailed text needs LESS simplification to avoid turning 'o' into square.
+    // We estimate "smallness" by contour length.
+    if (contour.length < 50) {
+        // Very small detail: Minimal simplification
+        return simplifyContour(contour, 0.4);
+    } else if (contour.length < 200) {
+        // Medium detail (Letters?)
+        return simplifyContour(contour, 0.8);
+    } else {
+        // Large shapes
+        return simplifyContour(contour, 1.5);
+    }
 };
 
 // Ramer-Douglas-Peucker Algorithm

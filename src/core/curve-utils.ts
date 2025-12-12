@@ -117,3 +117,64 @@ export const snapPoint = (
 
     return { pos: bestPos, snapped, type };
 };
+// V43: Bezier Support
+export type HandleType = 'corner' | 'smooth' | 'symmetric';
+
+export interface BezierNode {
+    pos: THREE.Vector2;
+    handleIn: THREE.Vector2;  // Relative to pos
+    handleOut: THREE.Vector2; // Relative to pos
+    type: HandleType;
+}
+
+/**
+ * Samples a full Bezier path into a polyline.
+ */
+export const sampleBezierPath = (
+    nodes: BezierNode[],
+    closed: boolean = true,
+    _tolerance: number = 1
+): THREE.Vector2[] => {
+    if (nodes.length < 2) return nodes.map(n => n.pos);
+
+    const result: THREE.Vector2[] = [];
+
+    for (let i = 0; i < nodes.length; i++) {
+        if (!closed && i === nodes.length - 1) {
+            result.push(nodes[i].pos.clone());
+            break;
+        }
+
+        const curr = nodes[i];
+        const next = nodes[(i + 1) % nodes.length];
+
+        // Bezier Segment
+        const p0 = curr.pos;
+        const p1 = curr.pos.clone().add(curr.handleOut);
+        const p2 = next.pos.clone().add(next.handleIn);
+        const p3 = next.pos;
+
+        // Estimate length: dist(p0,p3)
+        const dist = p0.distanceTo(p3);
+        const steps = Math.max(5, Math.ceil(dist / 5)); // 5px precision
+
+        for (let s = 0; s < steps; s++) {
+            const t = s / steps;
+            result.push(getCubicBezierPoint(t, p0, p1, p2, p3));
+        }
+    }
+    return result;
+};
+
+// Helper: Cubic Bezier Formula
+function getCubicBezierPoint(t: number, p0: THREE.Vector2, p1: THREE.Vector2, p2: THREE.Vector2, p3: THREE.Vector2): THREE.Vector2 {
+    const t2 = t * t;
+    const t3 = t2 * t;
+    const mt = 1 - t;
+    const mt2 = mt * mt;
+    const mt3 = mt2 * mt;
+
+    const x = mt3 * p0.x + 3 * mt2 * t * p1.x + 3 * mt * t2 * p2.x + t3 * p3.x;
+    const y = mt3 * p0.y + 3 * mt2 * t * p1.y + 3 * mt * t2 * p2.y + t3 * p3.y;
+    return new THREE.Vector2(x, y);
+}

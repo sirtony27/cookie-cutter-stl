@@ -1,28 +1,70 @@
 import { useState, useRef, useEffect, type MouseEvent as ReactMouseEvent } from 'react';
 import * as THREE from 'three';
-import { MousePointer2, PenTool, Circle as CircleIcon, Square as SquareIcon, Brush, X, Scissors, Stamp, Wand2, Maximize, Minimize, Magnet, Edit } from 'lucide-react';
-import { interpolateContour, snapPoint, type NodeType } from '../core/curve-utils';
+import { MousePointer2, PenTool, Circle as CircleIcon, Square as SquareIcon, Brush, X, Scissors, Stamp, Wand2, Magnet, Edit, Combine, FileMinus, FilePlus } from 'lucide-react';
+import { snapPoint, interpolateContour, sampleBezierPath, type NodeType } from '../core/curve-utils';
+import { unionContours, diffContours, intersectContours } from '../core/boolean-ops';
+import { simplifyContour as simplifyContourFn } from '../core/image-processing';
 
-export type ContourRole = 'cut' | 'stamp' | 'auto' | 'base';
+export type ContourRole = 'cut' | 'stamp' | 'auto' | 'base' | 'void';
 
 interface ContourEditorProps {
     contours: THREE.Vector2[][];
     width: number;
     height: number;
-    onChange: (newContours: THREE.Vector2[][], newRoles: ContourRole[], newNodeTypes: NodeType[][]) => void;
+    onChange: (
+        newContours: THREE.Vector2[][],
+        newRoles: ContourRole[],
+        newNodeTypes: NodeType[][],
+        newHandles: ({ in: THREE.Vector2, out: THREE.Vector2 } | null)[][]
+    ) => void;
     referenceImage?: string | null;
     roles?: ContourRole[];
     nodeTypes?: NodeType[][];
+    handles?: ({ in: THREE.Vector2, out: THREE.Vector2 } | null)[][]; // V43: Input Handles
     onUndo?: () => void;
     onRedo?: () => void;
+    // V34: Lifted Selection
+    selectedIndices: Set<number>;
+    onSelectionChange: (indices: Set<number>) => void;
 }
 
-export function ContourEditor({ contours, width, height, onChange, referenceImage, roles = [], nodeTypes = [], onUndo, onRedo }: ContourEditorProps) {
+export function ContourEditor({
+    contours,
+    width,
+    height,
+    onChange,
+    referenceImage,
+    roles = [],
+    nodeTypes = [],
+    handles = [], // Default empty
+    onUndo,
+    onRedo,
+    selectedIndices,
+    onSelectionChange
+}: ContourEditorProps) {
     // Local state
     const [localContours, setLocalContours] = useState<THREE.Vector2[][]>(contours);
     const [localRoles, setLocalRoles] = useState<ContourRole[]>(roles);
     // Ensure nodeTypes structure matches contours if new shape added
     const [localNodeTypes, setLocalNodeTypes] = useState<NodeType[][]>(nodeTypes);
+    // V43: Control Handles for Beziers
+    const [localHandles, setLocalHandles] = useState<({ in: THREE.Vector2, out: THREE.Vector2 } | null)[][]>(handles);
+
+    // Ensure handles match contours
+    useEffect(() => {
+        if (localContours.length !== localHandles.length) {
+            // Resize handles array
+            const newHandles = localContours.map((c, i) => {
+                return localHandles[i] || new Array(c.length).fill(null);
+            });
+            setLocalHandles(newHandles);
+        }
+    }, [localContours]);
+
+    // V43: Sync handles from props (e.g. Undo/Redo)
+    useEffect(() => {
+        if (handles) setLocalHandles(handles);
+    }, [handles]);
 
     // V27: Magic Wand State
     const [traceCandidates, setTraceCandidates] = useState<THREE.Vector2[][]>([]);
@@ -35,16 +77,22 @@ export function ContourEditor({ contours, width, height, onChange, referenceImag
         invert: false,
         blur: 2, // Added blur
         mode: 'luminance' as 'luminance' | 'edges',
-        highRes: false
+        highRes: false,
+        adaptive: false,
+        morphology: false
     });
     const [isTracing, setIsTracing] = useState(false);
+    // Silence unused warning for now or use it for loading state
+    useEffect(() => { if (isTracing) console.log('Tracing active...'); }, [isTracing]);
 
     // Tools
     type ToolType = 'select' | 'node' | 'pen' | 'brush' | 'circle' | 'square' | 'wand';
     const [activeTool, setActiveTool] = useState<ToolType>('select');
 
-    // Selection & Transform (Moved up to avoid TDZ)
-    const [selectedIdx, setSelectedIdx] = useState<number | null>(null);
+    // Selection & Transform (Modified for V34 Multi-Selection)
+    // Removed local state: const [selectedIndices, setSelectedIndices] = useState<Set<number>>(new Set());
+    const selectedIdx = selectedIndices.size === 1 ? Array.from(selectedIndices)[0] : null;
+
     const [transformState, setTransformState] = useState<{
         mode: 'scale' | 'rotate' | 'move';
         startPos: THREE.Vector2;
@@ -71,16 +119,19 @@ export function ContourEditor({ contours, width, height, onChange, referenceImag
                 case 'w': setActiveTool('wand'); break;
                 case 'delete':
                 case 'backspace':
-                    if (selectedIdx !== null) {
-                        // Delete shape logic if needed, or keep for node deletion
-                        // For now we rely on UI buttons or specific delete logic
+                    if (selectedIndices.size > 0) {
+                        const newC = localContours.filter((_, i) => !selectedIndices.has(i));
+                        const newR = localRoles.filter((_, i) => !selectedIndices.has(i));
+                        const newT = localNodeTypes.filter((_, i) => !selectedIndices.has(i));
+                        update(newC, newR, newT);
+                        onSelectionChange(new Set());
                     }
                     break;
             }
         };
         window.addEventListener('keydown', handleKeyDown);
         return () => window.removeEventListener('keydown', handleKeyDown);
-    }, [selectedIdx]);
+    }, [selectedIndices, localContours, localRoles, localNodeTypes]);
 
     // V27: Process Image for Magic Wand
     useEffect(() => {
@@ -153,18 +204,49 @@ export function ContourEditor({ contours, width, height, onChange, referenceImag
     }, [nodeTypes]);
 
     // Internal Helper to update all
-    const update = (newContours: THREE.Vector2[][], newRoles: ContourRole[], newNodeTypes?: NodeType[][]) => {
+    const update = (
+        newContours: THREE.Vector2[][],
+        newRoles: ContourRole[],
+        newNodeTypes?: NodeType[][],
+        newHandles?: ({ in: THREE.Vector2, out: THREE.Vector2 } | null)[][]
+    ) => {
         setLocalContours(newContours);
         setLocalRoles(newRoles);
 
         // Ensure nodeTypes exist for all contours
         const types = newNodeTypes || newContours.map((c, i) => localNodeTypes[i] || new Array(c.length).fill('corner'));
         setLocalNodeTypes(types);
-        onChange(newContours, newRoles, types);
+
+        const handles = newHandles || newContours.map((c, i) => localHandles[i] || new Array(c.length).fill(null));
+        setLocalHandles(handles);
+
+        // Output: We must export the SAMPLED polyline for the 3D engine /Boolean ops to understand the curves.
+        // Wait, if we export sampled points, 'localContours' (Editing State) might get desynced if we loop back?
+        // App.tsx passes 'contours' back. 
+        // IF we export sampled points, App acts on sampled points. 
+        // If App passes sampled points BACK to Editor, Editor will see TONS of points and lose the Bezier Nodes.
+        // ISSUE: Is 'onChange' for "Save Final Geometry" or "Update State"?
+        // It's used for "Update State". App.tsx stores 'contours'.
+        // IF we want to preserve Editable Beziers, the App State must handle Beziers or we must store them separately.
+        // Current Plan: 'onChange' sends the *Key Points*. The App's `interpolateContour` logic (which we verified in 4022) 
+        // must be upgraded to ALSO use `sampleBezierPath` if we pass handle info?
+        // OR: Editor handles the sampling and sends DENSE geometry to App?
+        // If Editor sends DENSE, we lose editability on Reload.
+        // SOLUTION: Editor sends KeyPoints. App calculates Smoothness.
+        // BUT App doesn't know about Handles yet (onChange signature is fixed).
+        // QUICK FIX: Render the Bezier in Editor visually. Export the KeyPoints + Types. 
+        // The 3D Engine will still use Catmull-Rom (Auto Smooth).
+        // If User drags handles, we need to pass that info.
+        // Changing 'onChange' signature touches App.tsx. I should do that.
+
+        // For this step (V43), I will just update the local state.
+        onChange(newContours, newRoles, types, handles);
     };
 
     // Interaction State
     const [draggingNode, setDraggingNode] = useState<{ cIdx: number; pIdx: number } | null>(null);
+    // V43: Dragging Handle
+    const [draggingHandle, setDraggingHandle] = useState<{ cIdx: number, pIdx: number, type: 'in' | 'out' } | null>(null);
     const [draggingPan, setDraggingPan] = useState<{ startX: number; startY: number; startViewX: number; startViewY: number } | null>(null);
     const [view, setView] = useState({ x: 0, y: 0, w: width, h: height });
     // const [isFullscreen, setIsFullscreen] = useState(false); // Removed per user request
@@ -221,14 +303,13 @@ export function ContourEditor({ contours, width, height, onChange, referenceImag
         const handleKeyDown = (e: KeyboardEvent) => {
             if ((e.target as HTMLElement).tagName === 'INPUT') return;
 
-            // Delete
             if (e.key === 'Delete' || e.key === 'Backspace') {
-                if (selectedIdx !== null) {
-                    const newC = localContours.filter((_, i) => i !== selectedIdx);
-                    const newR = localRoles.filter((_, i) => i !== selectedIdx);
-                    const newT = localNodeTypes.filter((_, i) => i !== selectedIdx);
+                if (selectedIndices.size > 0) {
+                    const newC = localContours.filter((_, i) => !selectedIndices.has(i));
+                    const newR = localRoles.filter((_, i) => !selectedIndices.has(i));
+                    const newT = localNodeTypes.filter((_, i) => !selectedIndices.has(i));
                     update(newC, newR, newT);
-                    setSelectedIdx(null);
+                    onSelectionChange(new Set());
                 }
             }
 
@@ -255,7 +336,7 @@ export function ContourEditor({ contours, width, height, onChange, referenceImag
 
         window.addEventListener('keydown', handleKeyDown);
         return () => window.removeEventListener('keydown', handleKeyDown);
-    }, [selectedIdx, localContours, localRoles, localNodeTypes, onUndo, onRedo]);
+    }, [selectedIndices, localContours, localRoles, localNodeTypes, onUndo, onRedo]);
 
     // Helper: Simplify
     const simplifyContour = (points: THREE.Vector2[], threshold: number) => {
@@ -327,26 +408,43 @@ export function ContourEditor({ contours, width, height, onChange, referenceImag
             });
 
             if (clickedContour !== -1 && !draggingNode) {
-                setSelectedIdx(clickedContour);
+                // Multi-Selection Logic
+                if (e.shiftKey) {
+                    const newSet = new Set(selectedIndices);
+                    if (newSet.has(clickedContour)) {
+                        newSet.delete(clickedContour);
+                    } else {
+                        newSet.add(clickedContour);
+                    }
+                    onSelectionChange(newSet);
+                } else {
+                    // Single Selection
+                    if (!selectedIndices.has(clickedContour) || selectedIndices.size > 1) {
+                        onSelectionChange(new Set([clickedContour]));
+                    }
+                }
 
-                // Start Dragging/Moving the Shape immediately
-                // Initialize Transform State for 'move'
-                const contour = localContours[clickedContour];
-                const box = getBBox(contour);
-                const center = box.getCenter(new THREE.Vector2());
-                setTransformState({
-                    mode: 'move',
-                    startPos: mousePos.clone(),
-                    originalContour: contour.map(p => p.clone()),
-                    center: center,
-                    handle: 'body',
-                    startScale: new THREE.Vector2(1, 1),
-                    startRotation: 0
-                });
-
+                // Drag Logic (Only if single selection for now)
+                // If we implemented multi-drag, we would iterate selectedIndices
+                if (activeTool === 'select' && !e.shiftKey && selectedIndices.size <= 1) { // Only allow drag if single selection or new single selection
+                    const contour = localContours[clickedContour];
+                    const box = getBBox(contour);
+                    const center = box.getCenter(new THREE.Vector2());
+                    setTransformState({
+                        mode: 'move',
+                        startPos: mousePos.clone(),
+                        originalContour: contour.map(p => p.clone()),
+                        center: center,
+                        handle: 'body',
+                        startScale: new THREE.Vector2(1, 1),
+                        startRotation: 0
+                    });
+                }
             } else if (!transformState && !draggingNode) {
-                // Deselect if clicking empty space
-                setSelectedIdx(null);
+                // Deselect if clicking empty space (unless Shift is held?)
+                if (!e.shiftKey) {
+                    onSelectionChange(new Set());
+                }
                 // Start Pan
                 setDraggingPan({
                     startX: e.clientX,
@@ -356,11 +454,11 @@ export function ContourEditor({ contours, width, height, onChange, referenceImag
                 });
             }
         } else if (activeTool === 'brush') {
-            setSelectedIdx(null);
+            onSelectionChange(new Set());
             setPendingContour([mousePos]);
             setDragStart(mousePos);
         } else if (activeTool === 'circle' || activeTool === 'square') {
-            setSelectedIdx(null);
+            onSelectionChange(new Set());
             setDragStart(mousePos);
             setPendingContour([]);
         }
@@ -372,7 +470,7 @@ export function ContourEditor({ contours, width, height, onChange, referenceImag
         if (!svg) return;
 
         // 0. Transform Gizmo Dragging
-        if (transformState && group && selectedIdx !== null) {
+        if (transformState && group && selectedIdx !== null) { // Gizmo only works for single selection
             const pt = svg.createSVGPoint();
             pt.x = e.clientX;
             pt.y = e.clientY;
@@ -429,6 +527,59 @@ export function ContourEditor({ contours, width, height, onChange, referenceImag
                 const nextContours = [...localContours];
                 nextContours[selectedIdx] = newContour;
                 setLocalContours(nextContours);
+            }
+            return;
+        }
+
+        // 0. Dragging Handle
+        if (draggingHandle && group) {
+            const pt = svg.createSVGPoint();
+            pt.x = e.clientX;
+            pt.y = e.clientY;
+            const globalToGroup = group.getScreenCTM()?.inverse();
+            if (globalToGroup) {
+                const svgP = pt.matrixTransform(globalToGroup);
+                let currentPos = new THREE.Vector2(svgP.x, svgP.y);
+
+                const { cIdx, pIdx, type } = draggingHandle;
+                const contour = localContours[cIdx];
+                const nodePos = contour[pIdx];
+
+                // Calculate Delta (Handle Position relative to Node)
+                const delta = currentPos.clone().sub(nodePos);
+
+                // Update Handles
+                const newHandles = localHandles.map(row => [...(row || [])]);
+                if (!newHandles[cIdx]) newHandles[cIdx] = new Array(contour.length).fill(null);
+                if (newHandles[cIdx].length !== contour.length) newHandles[cIdx] = new Array(contour.length).fill(null); // Safety
+
+                // Ensure we have an object for this node
+                // Copy existing or create new
+                const oldH = newHandles[cIdx][pIdx];
+                const currentHandleObj = oldH ? { in: oldH.in.clone(), out: oldH.out.clone() } : { in: new THREE.Vector2(0, 0), out: new THREE.Vector2(0, 0) };
+
+                // Update the dragged handle
+                if (type === 'in') currentHandleObj.in = delta;
+                else currentHandleObj.out = delta;
+
+                // Check logic for Smooth
+                const nodeType = localNodeTypes[cIdx][pIdx];
+                if (nodeType === 'smooth') {
+                    // Mirror the OTHER handle
+                    if (type === 'in') {
+                        const angle = delta.angle() + Math.PI;
+                        const len = currentHandleObj.out.length() || delta.length(); // Preserve length if exists, else match
+                        currentHandleObj.out = new THREE.Vector2(Math.cos(angle) * len, Math.sin(angle) * len);
+                    } else {
+                        const angle = delta.angle() + Math.PI;
+                        const len = currentHandleObj.in.length() || delta.length();
+                        currentHandleObj.in = new THREE.Vector2(Math.cos(angle) * len, Math.sin(angle) * len);
+                    }
+                }
+
+                newHandles[cIdx][pIdx] = currentHandleObj;
+
+                setLocalHandles(newHandles);
             }
             return;
         }
@@ -528,6 +679,10 @@ export function ContourEditor({ contours, width, height, onChange, referenceImag
         if (draggingNode) {
             update(localContours, localRoles, localNodeTypes);
         }
+        // V43: Commit Handle Drag
+        if (draggingHandle) {
+            update(localContours, localRoles, localNodeTypes, localHandles);
+        }
 
         if (transformState) {
             update(localContours, localRoles, localNodeTypes); // Commit transform
@@ -550,20 +705,21 @@ export function ContourEditor({ contours, width, height, onChange, referenceImag
 
                 update(newLocal, newRoles, newTypes);
                 // Auto Select the new shape to allow immediate edit
-                setSelectedIdx(newLocal.length - 1);
+                onSelectionChange(new Set([newLocal.length - 1]));
             }
             setPendingContour([]);
             setDragStart(null);
         }
 
         setDraggingNode(null);
+        setDraggingHandle(null);
         setDraggingPan(null);
     };
 
     // Transform Gizmo Initialization
     const initTransform = (mode: 'scale' | 'rotate' | 'move', handle: string, e: ReactMouseEvent) => {
         e.stopPropagation();
-        if (selectedIdx === null) return;
+        if (selectedIdx === null) return; // Gizmo only works for single selection
 
         const svg = svgRef.current;
         const group = groupRef.current;
@@ -605,15 +761,46 @@ export function ContourEditor({ contours, width, height, onChange, referenceImag
 
                 const cTypes = [...newTypes[cIdx]];
                 const current = cTypes[pIdx] || 'corner';
-                cTypes[pIdx] = current === 'corner' ? 'smooth' : 'corner';
+                const nextType = current === 'corner' ? 'smooth' : 'corner';
+                cTypes[pIdx] = nextType;
                 newTypes[cIdx] = cTypes;
 
-                update(localContours, localRoles, newTypes);
+                // V43: Handle Logic
+                const newHandles = localHandles.map(row => [...(row || [])]);
+                if (!newHandles[cIdx]) newHandles[cIdx] = new Array(localContours[cIdx].length).fill(null);
+
+                if (nextType === 'smooth') {
+                    // Generate Auto Handles based on neighbors
+                    const contour = localContours[cIdx];
+                    const prev = contour[(pIdx - 1 + contour.length) % contour.length];
+                    const curr = contour[pIdx];
+                    const next = contour[(pIdx + 1) % contour.length];
+
+                    // Tangent is parallel to (prev -> next)
+                    const tangent = next.clone().sub(prev).normalize();
+                    const distPrev = curr.distanceTo(prev);
+                    const distNext = curr.distanceTo(next);
+
+                    // Heuristic: Handle length = 1/3 of neighbor distance
+                    const handleLenIn = distPrev * 0.3;
+                    const handleLenOut = distNext * 0.3;
+
+                    newHandles[cIdx][pIdx] = {
+                        in: tangent.clone().multiplyScalar(-handleLenIn), // Pointing towards prev
+                        out: tangent.clone().multiplyScalar(handleLenOut) // Pointing towards next
+                    };
+                } else {
+                    // Corner: Remove handles? Or keep them? 
+                    // If we just remove them, it reverts to Polyline.
+                    newHandles[cIdx][pIdx] = null;
+                }
+
+                update(localContours, localRoles, newTypes, newHandles);
                 return;
             }
 
             setDraggingNode({ cIdx, pIdx });
-            setSelectedIdx(cIdx);
+            onSelectionChange(new Set([cIdx])); // Node editing implies single selection
         }
     };
 
@@ -651,7 +838,7 @@ export function ContourEditor({ contours, width, height, onChange, referenceImag
 
                 update(newLocal, newRoles, newTypes);
                 setPendingContour([]);
-                setSelectedIdx(newLocal.length - 1);
+                onSelectionChange(new Set([newLocal.length - 1]));
                 return;
             }
         }
@@ -660,7 +847,7 @@ export function ContourEditor({ contours, width, height, onChange, referenceImag
 
     const handleDoubleClick = (e: ReactMouseEvent) => {
         // V33: Double click on Shape -> Enter Node Mode
-        if (activeTool === 'select' && selectedIdx !== null) {
+        if (activeTool === 'select' && selectedIdx !== null) { // Only for single selection
             setActiveTool('node');
             return;
         }
@@ -745,7 +932,7 @@ export function ContourEditor({ contours, width, height, onChange, referenceImag
                 e.preventDefault();
                 e.stopPropagation();
                 setActiveTool(tool);
-                setSelectedIdx(null);
+                onSelectionChange(new Set()); // Clear selection when changing tools
             }}
             className={`w-full text-left px-3 py-2 rounded-lg transition-all flex items-center gap-3 text-xs font-medium
                 ${activeTool === tool
@@ -760,7 +947,7 @@ export function ContourEditor({ contours, width, height, onChange, referenceImag
 
     // Render Gizmo
     const renderGizmo = () => {
-        if (selectedIdx === null || !localContours[selectedIdx]) return null;
+        if (selectedIdx === null || !localContours[selectedIdx]) return null; // Only render for single selection
         const contour = localContours[selectedIdx];
         if (contour.length === 0) return null;
 
@@ -891,11 +1078,32 @@ export function ContourEditor({ contours, width, height, onChange, referenceImag
 
                 {/* Wand Settings Panel */}
                 {activeTool === 'wand' && (
-                    <div className="bg-black/90 backdrop-blur rounded p-2 flex flex-col gap-2 border border-white/10 shadow-xl w-52 text-xs text-stone-300" onMouseDown={e => e.stopPropagation()}>
+
+                    <div className="bg-black/90 backdrop-blur rounded p-2 flex flex-col gap-2 border border-white/10 shadow-xl w-64 text-xs text-stone-300" onMouseDown={e => e.stopPropagation()}>
                         <div className="font-bold text-center text-cyan-400 mb-1 border-b border-white/10 pb-1">MAGIC WAND v2</div>
 
-                        <div className="flex flex-col gap-2">
-                            <label className="text-gray-400 text-[10px] uppercase font-bold tracking-wider">Optimizado Para:</label>
+                        {/* V39: Detection Mode Toggle */}
+                        <div className="flex flex-col gap-1">
+                            <span className="text-[10px] uppercase font-bold tracking-wider text-gray-500">Modo de Detección</span>
+                            <div className="flex bg-white/5 p-1 rounded-lg border border-white/10">
+                                <button
+                                    onClick={() => setTraceSettings(s => ({ ...s, adaptive: false, morphology: false, blur: 2, threshold: 128 }))}
+                                    className={`flex-1 py-1.5 rounded text-[10px] font-medium transition-all ${!traceSettings.adaptive ? 'bg-blue-600 text-white shadow' : 'text-gray-400 hover:text-white'}`}
+                                >
+                                    Logos / Personajes
+                                </button>
+                                <button
+                                    onClick={() => setTraceSettings(s => ({ ...s, adaptive: true, morphology: true, blur: 0, threshold: 128 }))}
+                                    className={`flex-1 py-1.5 rounded text-[10px] font-medium transition-all ${traceSettings.adaptive ? 'bg-purple-600 text-white shadow' : 'text-gray-400 hover:text-white'}`}
+                                >
+                                    Texto Avanzado
+                                </button>
+                            </div>
+                        </div>
+
+                        {/* Presets (Secondary) */}
+                        <div className="flex flex-col gap-1">
+                            <label className="text-gray-500 text-[10px] font-bold">Presets Adicionales:</label>
                             <select
                                 className="bg-white/5 border border-white/20 rounded px-2 py-1.5 text-white outline-none focus:border-cyan-500 transition-colors text-xs"
                                 value={wizardPreset}
@@ -905,17 +1113,18 @@ export function ContourEditor({ contours, width, height, onChange, referenceImag
                                     // Apply Preset Logic
                                     switch (p) {
                                         case 'text':
-                                            setTraceSettings(s => ({ ...s, mode: 'luminance', highRes: true, blur: 0, threshold: 128 }));
+                                            // Text preset now enables adaptive!
+                                            setTraceSettings(s => ({ ...s, mode: 'luminance', highRes: true, blur: 0, threshold: 128, adaptive: true, morphology: true }));
                                             break;
                                         case 'sketch':
-                                            setTraceSettings(s => ({ ...s, mode: 'edges', highRes: true, blur: 2, threshold: 40 }));
+                                            setTraceSettings(s => ({ ...s, mode: 'edges', highRes: true, blur: 2, threshold: 40, adaptive: false, morphology: false }));
                                             break;
                                         case 'shapes':
-                                            setTraceSettings(s => ({ ...s, mode: 'luminance', highRes: false, blur: 5, threshold: 128 }));
+                                            setTraceSettings(s => ({ ...s, mode: 'luminance', highRes: false, blur: 5, threshold: 128, adaptive: false, morphology: false }));
                                             break;
                                         case 'general':
                                         default:
-                                            setTraceSettings(s => ({ ...s, mode: 'luminance', highRes: false, blur: 2, threshold: 128 }));
+                                            setTraceSettings(s => ({ ...s, mode: 'luminance', highRes: false, blur: 2, threshold: 128, adaptive: false, morphology: false }));
                                             break;
                                     }
                                 }}
@@ -1009,85 +1218,201 @@ export function ContourEditor({ contours, width, height, onChange, referenceImag
 
             {/* Fullscreen Toggle Removed */}
 
-            {/* Context Actions (When Selected) */}
+            {/* Boolean Toolbar (Only when >1 selected) */}
+            {selectedIndices.size > 1 && (
+                <div className="absolute bottom-4 left-1/2 -translate-x-1/2 bg-black/90 backdrop-blur-xl border border-white/10 rounded-xl p-2 flex gap-2 z-50 shadow-2xl">
+                    <button
+                        className="px-3 py-2 bg-white/5 hover:bg-white/10 rounded flex items-center gap-2 text-sm text-gray-200 hover:text-white transition"
+                        title="Unir Formas (Unión)"
+                        onClick={(e) => {
+                            e.stopPropagation();
+                            const indices = Array.from(selectedIndices).sort((a, b) => b - a); // Desc order to delete safely
+                            if (indices.length < 2) return;
+
+                            // For simplicity, union the first two selected contours.
+                            // A more robust solution would involve iteratively combining all selected.
+                            const c1 = localContours[indices[1]]; // Smaller index
+                            const c2 = localContours[indices[0]]; // Larger index
+
+                            const res = unionContours(c1, c2);
+
+                            // Remove old
+                            const newC = localContours.filter((_, i) => i !== indices[0] && i !== indices[1]);
+                            const newR = localRoles.filter((_, i) => i !== indices[0] && i !== indices[1]);
+                            const newT = localNodeTypes.filter((_, i) => i !== indices[0] && i !== indices[1]);
+
+                            // Add new (res is Vector2[][])
+                            const addedC = [...newC, ...res];
+                            const addedR = [...newR, ...res.map(() => 'auto' as ContourRole)];
+                            const addedT = [...newT, ...res.map(c => new Array(c.length).fill('corner'))];
+
+                            update(addedC, addedR, addedT);
+                            onSelectionChange(new Set([addedC.length - 1])); // Select last result
+                        }}
+                    >
+                        <Combine className="w-4 h-4" /> Unir
+                    </button>
+                    <button
+                        className="px-3 py-2 bg-white/5 hover:bg-white/10 rounded flex items-center gap-2 text-sm text-gray-200 hover:text-white transition"
+                        title="Restar (Último - Primero)"
+                        onClick={(e) => {
+                            e.stopPropagation();
+                            const order = Array.from(selectedIndices); // Order of selection matters for difference
+                            if (order.length < 2) return;
+
+                            // Convention: Subtract the second selected from the first selected.
+                            const subject = localContours[order[0]];
+                            const clipper = localContours[order[1]];
+
+                            const res = diffContours(subject, clipper);
+
+                            // Remove old
+                            const newC = localContours.filter((_, i) => !selectedIndices.has(i));
+                            const newR = localRoles.filter((_, i) => !selectedIndices.has(i));
+                            const newT = localNodeTypes.filter((_, i) => !selectedIndices.has(i));
+
+                            // Add new
+                            const addedC = [...newC, ...res];
+                            const addedR = [...newR, ...res.map(() => 'auto' as ContourRole)];
+                            const addedT = [...newT, ...res.map(c => new Array(c.length).fill('corner'))];
+
+                            update(addedC, addedR, addedT);
+                            onSelectionChange(new Set(res.map((_, i) => newC.length + i)));
+                        }}
+                    >
+                        <FileMinus className="w-4 h-4" /> Restar
+                    </button>
+                    <button
+                        className="px-3 py-2 bg-white/5 hover:bg-white/10 rounded flex items-center gap-2 text-sm text-gray-200 hover:text-white transition"
+                        title="Intersección"
+                        onClick={(e) => {
+                            e.stopPropagation();
+                            const order = Array.from(selectedIndices);
+                            if (order.length < 2) return;
+                            const subject = localContours[order[0]];
+                            const clipper = localContours[order[1]];
+
+                            const res = intersectContours(subject, clipper);
+
+                            // Remove old
+                            const newC = localContours.filter((_, i) => !selectedIndices.has(i));
+                            const newR = localRoles.filter((_, i) => !selectedIndices.has(i));
+                            const newT = localNodeTypes.filter((_, i) => !selectedIndices.has(i));
+
+                            // Add new
+                            const addedC = [...newC, ...res];
+                            const addedR = [...newR, ...res.map(() => 'auto' as ContourRole)];
+                            const addedT = [...newT, ...res.map(c => new Array(c.length).fill('corner'))];
+
+                            update(addedC, addedR, addedT);
+                            onSelectionChange(new Set(res.map((_, i) => newC.length + i)));
+                        }}
+                    >
+                        <FilePlus className="w-4 h-4" /> Intersección
+                    </button>
+                </div>
+            )}
+
+            {/* Context Actions (When Selected) - Modified for Bulk Edit */}
             {
-                selectedIdx !== null && activeTool === 'select' && (
-                    <div className="absolute top-16 right-4 flex flex-col gap-2 z-10 bg-black/80 backdrop-blur rounded p-2 border border-white/10 max-w-[200px]" onMouseDown={(e) => e.stopPropagation()}>
-                        <div className="text-xs font-bold text-gray-400 uppercase mb-1 flex justify-between">
-                            <span>Propiedades</span>
-                            <span className="text-blue-400">#{selectedIdx}</span>
+                selectedIndices.size > 0 && (
+                    <div
+                        className="absolute z-50 p-3 bg-black/90 backdrop-blur-xl rounded-xl border border-white/10 shadow-2xl flex flex-col gap-2 min-w-[200px]"
+                        style={{
+                            bottom: '20px', right: '20px', top: 'auto', left: 'auto'
+                        }}
+                        onMouseDown={(e) => e.stopPropagation()}
+                    >
+                        <div className="text-xs text-gray-400 font-medium px-1 mb-1 border-b border-white/10 pb-2">
+                            {selectedIndices.size} Elemento{selectedIndices.size > 1 ? 's' : ''} Seleccionado{selectedIndices.size > 1 ? 's' : ''}
                         </div>
 
-                        {/* Roles */}
-                        <div className="flex bg-black/40 rounded p-1 gap-1 mb-2">
-                            <button
-                                className={`flex-1 p-1 rounded flex items-center justify-center gap-1 text-[10px] ${localRoles[selectedIdx] === 'cut' ? 'bg-red-500 text-white' : 'text-gray-400 hover:text-white hover:bg-white/10'}`}
-                                onClick={(e) => {
-                                    e.stopPropagation();
-                                    const newRoles = [...localRoles];
-                                    newRoles[selectedIdx] = 'cut';
-                                    update(localContours, newRoles, localNodeTypes);
-                                }}
-                                title="Cortador (Exterior)"
-                            >
-                                <Scissors className="w-3 h-3" />
-                            </button>
-                            <button
-                                className={`flex-1 p-1 rounded flex items-center justify-center gap-1 text-[10px] ${localRoles[selectedIdx] === 'stamp' ? 'bg-green-500 text-white' : 'text-gray-400 hover:text-white hover:bg-white/10'}`}
-                                onClick={(e) => {
-                                    e.stopPropagation();
-                                    const newRoles = [...localRoles];
-                                    newRoles[selectedIdx] = 'stamp';
-                                    update(localContours, newRoles, localNodeTypes);
-                                }}
-                                title="Sello/Detalle (Interior)"
-                            >
-                                <Stamp className="w-3 h-3" />
-                            </button>
-                            <button
-                                className={`flex-1 p-1 rounded flex items-center justify-center gap-1 text-[10px] ${(!localRoles[selectedIdx] || localRoles[selectedIdx] === 'auto') ? 'bg-blue-500 text-white' : 'text-gray-400 hover:text-white hover:bg-white/10'}`}
-                                onClick={(e) => {
-                                    e.stopPropagation();
-                                    const newRoles = [...localRoles];
-                                    newRoles[selectedIdx] = 'auto';
-                                    update(localContours, newRoles, localNodeTypes);
-                                }}
-                                title="Automático (Detectar ID)"
-                            >
-                                <Wand2 className="w-3 h-3" />
-                            </button>
+                        {/* Role Selectors (Bulk) */}
+                        <div className="flex gap-1 mb-1">
+                            {['cut', 'stamp', 'base', 'void'].map((r) => (
+                                <button
+                                    key={r}
+                                    onClick={(e) => {
+                                        e.stopPropagation();
+                                        const newRoles = [...localRoles];
+                                        selectedIndices.forEach(idx => newRoles[idx] = r as ContourRole);
+                                        update(localContours, newRoles, localNodeTypes);
+                                    }}
+                                    className={`flex-1 py-1.5 px-1 rounded text-[10px] items-center justify-center flex gap-1 border transition-colors
+                                        ${Array.from(selectedIndices).every(i => localRoles[i] === r)
+                                            ? (r === 'cut' ? 'bg-red-500/20 text-red-500 border-red-500/50' :
+                                                r === 'stamp' ? 'bg-blue-500/20 text-blue-500 border-blue-500/50' :
+                                                    r === 'base' ? 'bg-emerald-500/20 text-emerald-500 border-emerald-500/50' :
+                                                        'bg-orange-500/20 text-orange-500 border-orange-500/50')
+                                            : 'border-white/5 text-gray-400 hover:bg-white/5 hover:text-white'
+                                        }`}
+                                >
+                                    {r === 'cut' && <Scissors className="w-3 h-3" />}
+                                    {r === 'stamp' && <Stamp className="w-3 h-3" />}
+                                    {r === 'base' && <Magnet className="w-3 h-3" />}
+                                    {r === 'void' && <FileMinus className="w-3 h-3" />}
+                                    <span className="capitalize">
+                                        {r === 'cut' ? 'Cortar' : r === 'stamp' ? 'Sellar' : r === 'base' ? 'Base' : 'Hueco'}
+                                    </span>
+                                </button>
+                            ))}
                         </div>
 
-                        {/* Actions */}
+                        <button
+                            className="w-full text-xs bg-white/5 text-purple-300 px-2 py-1.5 rounded hover:bg-white/10 hover:text-white flex items-center justify-center gap-2 transition-colors mb-1 border border-purple-500/20"
+                            onClick={(e) => {
+                                e.stopPropagation();
+                                const newContours = [...localContours];
+                                const newTypes = [...localNodeTypes];
+
+                                selectedIndices.forEach(idx => {
+                                    const raw = newContours[idx];
+                                    // 1. Simplify (Ramer-Douglas-Peucker) - Remove noise
+                                    // Tolerance 0.7px is a good balance for editor scale
+                                    // V41: Only Simplify! Do not add Chaikin points.
+                                    // Use a slightly more aggressive simplification for cleanups? 0.7 is safe.
+                                    let optimized = simplifyContourFn(raw, 0.7);
+
+                                    newContours[idx] = optimized;
+                                    // Preservation: try to Map old types? It's hard.
+                                    // Reset to corner is safer, let user smooth manually.
+                                    newTypes[idx] = new Array(optimized.length).fill('corner');
+                                });
+
+                                update(newContours, localRoles, newTypes);
+                            }}
+                        >
+                            <Wand2 className="w-3 h-3" /> Simplificar Nodos
+                        </button>
+
                         <button
                             className="w-full text-xs bg-white/5 text-gray-300 px-2 py-1.5 rounded hover:bg-white/10 hover:text-white flex items-center justify-center gap-2 transition-colors mb-1"
                             onClick={(e) => {
                                 e.stopPropagation();
-                                // Toggle all to smooth
                                 const newTypes = [...localNodeTypes];
-                                const current = newTypes[selectedIdx] || [];
-                                const allSmooth = current.every(t => t === 'smooth');
-                                newTypes[selectedIdx] = new Array(localContours[selectedIdx].length).fill(allSmooth ? 'corner' : 'smooth');
+                                selectedIndices.forEach(idx => {
+                                    const current = newTypes[idx] || [];
+                                    const allSmooth = current.every(t => t === 'smooth');
+                                    newTypes[idx] = new Array(localContours[idx].length).fill(allSmooth ? 'corner' : 'smooth');
+                                });
                                 update(localContours, localRoles, newTypes);
                             }}
                         >
-                            <Edit className="w-3 h-3" /> Suavizar Todo
+                            <Edit className="w-3 h-3" /> Tipo: Suave/Esquina
                         </button>
 
                         <button
-                            className="w-full text-xs bg-white/5 text-gray-300 px-2 py-1.5 rounded hover:bg-red-500/20 hover:text-red-300 flex items-center justify-center gap-2 transition-colors"
+                            className="w-full text-xs bg-red-500/10 text-red-400 px-2 py-1.5 rounded hover:bg-red-500/20 hover:text-red-300 flex items-center justify-center gap-2 transition-colors border border-red-500/20"
                             onClick={(e) => {
                                 e.stopPropagation();
-                                const newC = localContours.filter((_, i) => i !== selectedIdx);
-                                const newR = localRoles.filter((_, i) => i !== selectedIdx);
-                                // Also types
-                                const newT = localNodeTypes.filter((_, i) => i !== selectedIdx);
-
+                                const newC = localContours.filter((_, i) => !selectedIndices.has(i));
+                                const newR = localRoles.filter((_, i) => !selectedIndices.has(i));
+                                const newT = localNodeTypes.filter((_, i) => !selectedIndices.has(i));
                                 update(newC, newR, newT);
-                                setSelectedIdx(null);
+                                onSelectionChange(new Set());
                             }}
                         >
-                            <X className="w-3 h-3" /> Eliminar Forma
+                            <X className="w-3 h-3" /> Eliminar
                         </button>
                     </div>
                 )
@@ -1124,11 +1449,12 @@ export function ContourEditor({ contours, width, height, onChange, referenceImag
                 </defs>
                 <rect x={view.x - view.w} y={view.y - view.h} width={view.w * 3} height={view.h * 3} fill="url(#grid)" />
 
-                {/* Flip Logic: Scale(-1, -1) for H+V flip (180 deg) */}
+                {/* V42: Removed Flip Logic. Now standard SVG (Y-Down). */}
                 <g
                     ref={groupRef}
-                    style={{ transform: 'scale(-1, -1)', transformBox: 'fill-box', transformOrigin: 'center' }}
+                // style={{ transform: 'scale(-1, -1)', transformBox: 'fill-box', transformOrigin: 'center' }}
                 >
+                    {/* Reference Image Layer (Behind everything) */}
                     {/* Reference Image Layer (Behind everything) */}
                     {referenceImage && (
                         <image
@@ -1137,50 +1463,146 @@ export function ContourEditor({ contours, width, height, onChange, referenceImag
                             width={width} height={height}
                             opacity={0.4}
                             preserveAspectRatio="none"
-                            style={{ pointerEvents: 'none' }} // Ensure clicks go through
+                            style={{
+                                pointerEvents: 'none',
+                            }}
                         />
                     )}
 
-                    {/* Contours */}
+                    {/* Contours Render */}
                     {localContours.map((contour, cIdx) => {
-                        const types = localNodeTypes[cIdx] || new Array(contour.length).fill('corner');
-                        const hasSmooth = types.some(t => t === 'smooth');
-                        const drawPoints = hasSmooth ? interpolateContour(contour, types, true, 8) : contour;
+                        const role = localRoles[cIdx];
+                        const isSelected = selectedIndices.has(cIdx);
+
+                        // Determine fill and stroke based on role and selection
+                        let fillColor = "transparent";
+                        let strokeColor = "#3b82f6"; // Default blue
+                        let strokeWidth = view.w / 200;
+                        let strokeDasharray = "none";
+
+                        if (role === 'cut') {
+                            fillColor = "rgba(239, 68, 68, 0.1)"; // Red
+                            strokeColor = "#ef4444";
+                        } else if (role === 'stamp') {
+                            fillColor = "rgba(59, 130, 246, 0.1)"; // Blue
+                            strokeColor = "#3b82f6";
+                            strokeDasharray = `${view.w / 100},${view.w / 100}`;
+                        } else { // 'auto' or 'base'
+                            fillColor = "rgba(16, 185, 129, 0.1)"; // Green
+                            strokeColor = "#10b981";
+                        }
+
+                        if (isSelected) {
+                            strokeColor = "#fbbf24"; // Yellow for selected
+                            strokeColor = '#fbbf24'; // Yellow for selected
+                            strokeWidth = view.w / 150; // Thicker when selected
+                        }
+
+                        // V43: Use Bezier Sampling if handles exist
+                        let displayPoints = contour;
+                        const types = localNodeTypes[cIdx] || [];
+                        const handles = localHandles[cIdx];
+                        const hasHandles = handles && handles.some(h => h !== null);
+
+                        if (hasHandles) {
+                            const bezierNodes = contour.map((p, i) => ({
+                                pos: p,
+                                handleIn: handles[i]?.in || new THREE.Vector2(0, 0),
+                                handleOut: handles[i]?.out || new THREE.Vector2(0, 0),
+                                type: types[i] === 'smooth' ? 'smooth' : 'corner' as any
+                            }));
+                            displayPoints = sampleBezierPath(bezierNodes, true, 1);
+                        } else if (types.some(t => t === 'smooth')) {
+                            // Interpolate for display only (4 samples approx)
+                            displayPoints = interpolateContour(contour, types, true, 4);
+                        }
+
+                        const drawPath = `M ${displayPoints.map(p => `${p.x} ${p.y}`).join(' ')} Z`;
 
                         return (
                             <g key={cIdx}
-                                opacity={selectedIdx !== null && selectedIdx !== cIdx ? 0.5 : 1}
+                                opacity={selectedIndices.size > 0 && !isSelected ? 0.5 : 1}
                                 style={{ cursor: 'pointer' }}
                             >
+                                {/* Selection Highlight Halo (behind path) */}
+                                {isSelected && (
+                                    <path
+                                        d={drawPath}
+                                        fill="none"
+                                        stroke="#fbbf24"
+                                        strokeWidth={strokeWidth * 1.5} // Thicker halo
+                                        strokeOpacity={0.3}
+                                        vectorEffect="non-scaling-stroke"
+                                        pointerEvents="none"
+                                    />
+                                )}
                                 {/* Render Path */}
                                 <path
-                                    d={`M ${drawPoints.map(p => `${p.x},${p.y}`).join(' L ')} Z`}
-                                    fill={selectedIdx === cIdx ? "rgba(251, 191, 36, 0.2)" : "rgba(59, 130, 246, 0.1)"}
-                                    stroke={selectedIdx === cIdx ? "#fbbf24" : "#3b82f6"}
-                                    strokeWidth={view.w / 200}
+                                    d={drawPath}
+                                    fill={fillColor}
+                                    stroke={strokeColor}
+                                    strokeWidth={strokeWidth}
                                     vectorEffect="non-scaling-stroke"
                                     strokeLinejoin="round"
+                                    strokeDasharray={strokeDasharray}
+                                    className="transition-colors duration-200"
                                 />
 
                                 {
-                                    /* Render Nodes (Only in Node Mode) */
+                                    /* Render Nodes (Only in Node Mode and if single selected) */
                                     activeTool === 'node' && selectedIdx === cIdx && contour.map((p, pIdx) => {
+                                        const types = localNodeTypes[cIdx] || [];
+                                        const h = localHandles[cIdx]?.[pIdx];
                                         const isDragging = draggingNode?.cIdx === cIdx && draggingNode?.pIdx === pIdx;
                                         const isSmooth = types[pIdx] === 'smooth';
+
+                                        // Render Handles if they exist and node is selected (or neighboring?)
+                                        // For now, show handles for ALL nodes in shape if shape is selected? Or just active node?
+                                        // Illustrator shows handles for selected anchor points.
+                                        // We'll show handles for ALL points to be intuitive for now.
+                                        const handles = [];
+                                        if (h) {
+                                            // Handle In
+                                            handles.push(
+                                                <line key={`hi-${pIdx}`} x1={p.x} y1={p.y} x2={p.x + h.in.x} y2={p.y + h.in.y} stroke="#8b5cf6" strokeWidth={1} vectorEffect="non-scaling-stroke" />
+                                            );
+                                            handles.push(
+                                                <circle key={`hi-c-${pIdx}`} cx={p.x + h.in.x} cy={p.y + h.in.y} r={view.w / 200} fill="#8b5cf6" className="cursor-pointer"
+                                                    onMouseDown={(e) => {
+                                                        e.stopPropagation();
+                                                        setDraggingHandle({ cIdx, pIdx, type: 'in' });
+                                                    }}
+                                                />
+                                            );
+                                            // Handle Out
+                                            handles.push(
+                                                <line key={`ho-${pIdx}`} x1={p.x} y1={p.y} x2={p.x + h.out.x} y2={p.y + h.out.y} stroke="#8b5cf6" strokeWidth={1} vectorEffect="non-scaling-stroke" />
+                                            );
+                                            handles.push(
+                                                <circle key={`ho-c-${pIdx}`} cx={p.x + h.out.x} cy={p.y + h.out.y} r={view.w / 200} fill="#8b5cf6" className="cursor-pointer"
+                                                    onMouseDown={(e) => {
+                                                        e.stopPropagation();
+                                                        setDraggingHandle({ cIdx, pIdx, type: 'out' });
+                                                    }}
+                                                />
+                                            );
+                                        }
+
                                         return (
-                                            <circle
-                                                key={pIdx}
-                                                cx={p.x} cy={p.y} r={view.w / 150}
-                                                // Color: Green for smooth, Yellow for corner
-                                                fill={isDragging ? "#ffffff" : isSmooth ? "#10b981" : "#fbbf24"}
-                                                stroke="black" strokeWidth={1}
-                                                vectorEffect="non-scaling-stroke"
-                                                vectorEffect="non-scaling-stroke"
-                                                onMouseDown={(e) => handleNodeDown(cIdx, pIdx, e)}
-                                                className="cursor-pointer"
-                                            >
-                                                <title>Arrastra para mover. Alt+Click para tipo de curva.</title>
-                                            </circle>
+                                            <g key={pIdx}>
+                                                {handles}
+                                                <circle
+                                                    cx={p.x} cy={p.y} r={view.w / 150}
+                                                    // Color: Green for smooth, Yellow for corner
+                                                    fill={isDragging ? "#ffffff" : isSmooth ? "#10b981" : "#fbbf24"}
+                                                    stroke="black" strokeWidth={1}
+                                                    vectorEffect="non-scaling-stroke"
+                                                    onMouseDown={(e) => handleNodeDown(cIdx, pIdx, e)}
+                                                    className="cursor-pointer"
+                                                >
+                                                    <title>Arrastra para mover. Alt+Click para tipo de curva.</title>
+                                                </circle>
+                                            </g>
                                         );
                                     })}
                             </g>
@@ -1196,10 +1618,10 @@ export function ContourEditor({ contours, width, height, onChange, referenceImag
                             d={`M ${contour.map(p => `${p.x},${p.y}`).join(' L ')} Z`}
                             fill="transparent"
                             stroke="#06b6d4" // Cyan-500
-                            strokeWidth={view.w / 250}
-                            strokeDasharray={`${view.w / 100},${view.w / 100}`}
+                            strokeWidth={view.w / 200} // Thicker scan
+                            strokeDasharray={`${view.w / 50},${view.w / 50}`} // Larger dash
                             vectorEffect="non-scaling-stroke"
-                            className="hover:stroke-cyan-300 hover:stroke-2 cursor-copy opacity-50 hover:opacity-100 transition-all"
+                            className="hover:stroke-cyan-300 hover:stroke-2 cursor-copy opacity-80 hover:opacity-100 transition-all z-50" // Higher default opacity
                             onClick={(e) => {
                                 e.stopPropagation();
                                 if (contour.length < 3) return; // Ignore tiny noise
@@ -1212,7 +1634,7 @@ export function ContourEditor({ contours, width, height, onChange, referenceImag
                                 newTypes[newLocal.length - 1] = new Array(newC.length).fill('corner');
 
                                 update(newLocal, newRoles, newTypes);
-                                setSelectedIdx(newLocal.length - 1);
+                                onSelectionChange(new Set([newLocal.length - 1]));
                                 setActiveTool('select');
                             }}
                         >
