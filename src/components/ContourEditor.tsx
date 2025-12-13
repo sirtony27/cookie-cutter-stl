@@ -1,10 +1,11 @@
 import { useState, useRef, useEffect, type MouseEvent as ReactMouseEvent } from 'react';
 import * as THREE from 'three';
-import { MousePointer2, PenTool, Circle as CircleIcon, Square as SquareIcon, Brush, X, Wand2, Magnet, Edit, Heart, Star, Move, FileMinus, FlipHorizontal, FlipVertical, Keyboard } from 'lucide-react';
+import { MousePointer2, PenTool, Circle as CircleIcon, Square as SquareIcon, Brush, X, Wand2, Magnet, Edit, Heart, Star, Move, FileMinus, FlipHorizontal, FlipVertical, Keyboard, Type } from 'lucide-react';
 import { generateCircle, generateHeart, generateStar, generateRectangle } from '../core/shape-templates';
 import { snapPoint, interpolateContour, sampleBezierPath, type NodeType } from '../core/curve-utils';
 
-import { simplifyContour as simplifyContourFn } from '../core/image-processing';
+import { simplifyContour as simplifyContourFn, analyzeImage, type TracePresetType } from '../core/image-processing';
+import { TextToolPanel } from './TextToolPanel';
 
 export type ContourRole = 'cut' | 'stamp' | 'auto' | 'base' | 'void';
 
@@ -201,8 +202,46 @@ export function ContourEditor({
     const [traceCandidates, setTraceCandidates] = useState<THREE.Vector2[][]>([]);
     // V29: Added mode and highRes
     // V32: Added preset tracking
-    type WizardPreset = 'general' | 'text' | 'sketch' | 'shapes';
-    const [wizardPreset, setWizardPreset] = useState<WizardPreset>('general');
+    type WizardPreset = 'general' | 'text' | 'sketch' | 'shapes' | 'img'; // Added 'img'
+    const [wizardPreset, setWizardPreset] = useState<WizardPreset>('img');
+    const [detectedType, setDetectedType] = useState<TracePresetType | null>(null);
+
+    // V44: Internal Clipboard
+    interface LocalClipboardItem {
+        contour: THREE.Vector2[];
+        role: ContourRole;
+        types: NodeType[];
+        handles: ({ in: THREE.Vector2, out: THREE.Vector2 } | null)[];
+    }
+    const [clipboard, setClipboard] = useState<LocalClipboardItem[] | null>(null);
+
+    // V40: Auto-Analyze Image
+    useEffect(() => {
+        if (referenceImage) {
+            const img = new Image();
+            img.crossOrigin = 'Anonymous'; // Ensure cross-origin loading
+            img.onload = () => {
+                const result = analyzeImage(img);
+                setDetectedType(result.type);
+                // Auto-Apply Settings
+                setTraceSettings(s => ({
+                    ...s,
+                    blur: result.blur,
+                    threshold: result.threshold,
+                    adaptive: result.adaptive,
+                    morphology: result.morphology
+                }));
+            };
+            img.onerror = (e) => {
+                console.error("Failed to load reference image for analysis:", e);
+                setDetectedType(null);
+            };
+            img.src = referenceImage;
+        } else {
+            setDetectedType(null);
+        }
+    }, [referenceImage]);
+
     const [traceSettings, setTraceSettings] = useState({
         threshold: 128,
         invert: false,
@@ -217,7 +256,7 @@ export function ContourEditor({
     useEffect(() => { if (isTracing) console.log('Tracing active...'); }, [isTracing]);
 
     // Tools
-    type ToolType = 'select' | 'node' | 'pen' | 'brush' | 'circle' | 'square' | 'wand';
+    type ToolType = 'select' | 'node' | 'pen' | 'brush' | 'circle' | 'square' | 'wand' | 'text';
     const [activeTool, setActiveTool] = useState<ToolType>('select');
     // V55: Shortcuts Modal State
     const [showShortcuts, setShowShortcuts] = useState(false);
@@ -449,9 +488,55 @@ export function ContourEditor({
             if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
                 e.preventDefault();
                 if (e.shiftKey) {
-                    onRedo?.();
+                    if (onRedo) onRedo();
                 } else {
-                    onUndo?.();
+                    if (onUndo) onUndo();
+                }
+            }
+
+            // V44: Copy / Paste
+            if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'c') {
+                if (selectedIndices.size > 0) {
+                    e.preventDefault(); // Prevent browser copy (optional, but good for app feel)
+                    const items: LocalClipboardItem[] = [];
+                    selectedIndices.forEach(idx => {
+                        if (localContours[idx]) {
+                            items.push({
+                                contour: localContours[idx].map(p => p.clone()),
+                                role: localRoles[idx],
+                                types: [...(localNodeTypes[idx] || [])],
+                                handles: localHandles[idx]?.map(h => h ? { in: h.in.clone(), out: h.out.clone() } : null) || []
+                            });
+                        }
+                    });
+                    setClipboard(items);
+                    // Could add toast here: "Copied!"
+                }
+            }
+
+            if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'v') {
+                if (clipboard && clipboard.length > 0) {
+                    e.preventDefault();
+                    const newContours = [...localContours];
+                    const newRoles = [...localRoles];
+                    const newTypes = [...localNodeTypes];
+                    const newHandlesList = [...localHandles];
+                    const newSelection = new Set<number>();
+
+                    // Offset 10px down-right
+                    const offset = new THREE.Vector2(view.w / 50, view.w / 50);
+
+                    clipboard.forEach(item => {
+                        const nextIdx = newContours.length;
+                        newContours.push(item.contour.map(p => p.clone().add(offset)));
+                        newRoles.push(item.role);
+                        newTypes.push([...item.types]);
+                        newHandlesList.push(item.handles.map(h => h ? { in: h.in.clone(), out: h.out.clone() } : null));
+                        newSelection.add(nextIdx);
+                    });
+
+                    update(newContours, newRoles, newTypes, newHandlesList);
+                    onSelectionChange(newSelection);
                 }
             }
             if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y') {
@@ -459,11 +544,15 @@ export function ContourEditor({
                 onRedo?.();
             }
 
-            // Tools
-            if (e.key.toLowerCase() === 'v') setActiveTool('select');
-            if (e.key.toLowerCase() === 'p') setActiveTool('pen');
-            if (e.key.toLowerCase() === 'b') setActiveTool('brush');
-            if (e.key.toLowerCase() === 'w') setActiveTool('wand');
+            // Tools (Ignore if Ctrl is pressed)
+            if (!e.ctrlKey && !e.metaKey) {
+                if (e.key.toLowerCase() === 'v') setActiveTool('select');
+                if (e.key.toLowerCase() === 'p') setActiveTool('pen');
+                if (e.key.toLowerCase() === 'b') setActiveTool('brush');
+                if (e.key.toLowerCase() === 'b') setActiveTool('brush');
+                if (e.key.toLowerCase() === 'w') setActiveTool('wand');
+                if (e.key.toLowerCase() === 't') setActiveTool('text');
+            }
         };
 
         window.addEventListener('keydown', handleKeyDown);
@@ -610,6 +699,31 @@ export function ContourEditor({
             setDragStart(mousePos);
             setPendingContour([]);
         }
+    };
+
+
+    // V56: Handle Text Add
+    const handleAddText = (newContours: THREE.Vector2[][]) => {
+        const center = new THREE.Vector2(view.x + view.w / 2, view.y + view.h / 2);
+        const movedContours = newContours.map(c => c.map(p => p.clone().add(center)));
+
+        const nextIdx = localContours.length;
+        const addedContours = [...localContours, ...movedContours];
+        const addedRoles = [...localRoles, ...new Array(movedContours.length).fill('auto') as ContourRole[]];
+
+        // Types: 'corner' is safe for high-res trace
+        const addedTypes = [...localNodeTypes, ...movedContours.map(c => new Array(c.length).fill('corner') as NodeType[])];
+        const addedHandles = [...localHandles, ...movedContours.map(c => new Array(c.length).fill(null))];
+
+        // Select new items
+        const newSel = new Set<number>();
+        for (let i = 0; i < movedContours.length; i++) {
+            newSel.add(nextIdx + i);
+        }
+
+        update(addedContours, addedRoles, addedTypes, addedHandles);
+        onSelectionChange(newSel);
+        setActiveTool('select');
     };
 
     // V46: Shape Tool Logic
@@ -1250,6 +1364,7 @@ export function ContourEditor({
                     <ToolButton tool="brush" icon={Brush} label="Pincel (B)" />
                     <ToolButton tool="pen" icon={PenTool} label="Pluma (P)" />
                     <ToolButton tool="wand" icon={Wand2} label="Varita Mágica (W)" />
+                    <ToolButton tool="text" icon={Type} label="Texto Profesional (T)" />
                     <div className="w-full h-px bg-white/10 my-0.5" />
                     <ToolButton tool="circle" icon={CircleIcon} label="Dibujar Círculo" />
                     <ToolButton tool="square" icon={SquareIcon} label="Dibujar Cuadrado" />
@@ -1305,7 +1420,14 @@ export function ContourEditor({
             {activeTool === 'wand' && (
 
                 <div className="absolute bottom-20 left-4 bg-black/90 backdrop-blur rounded p-2 flex flex-col gap-2 border border-white/10 shadow-xl w-64 text-xs text-stone-300 z-50" onMouseDown={e => e.stopPropagation()}>
-                    <div className="font-bold text-center text-cyan-400 mb-1 border-b border-white/10 pb-1">MAGIC WAND v2</div>
+                    <div className="font-bold text-center text-cyan-400 mb-1 border-b border-white/10 pb-1 flex justify-between items-center px-2">
+                        <span>MAGIC WAND v2</span>
+                        {detectedType && (
+                            <span className="text-[9px] bg-white/10 px-1.5 py-0.5 rounded border border-white/5 text-gray-400 font-normal capitalize">
+                                {detectedType}
+                            </span>
+                        )}
+                    </div>
 
                     {/* V39: Detection Mode Toggle */}
                     <div className="flex flex-col gap-1">
@@ -1438,6 +1560,14 @@ export function ContourEditor({
                         </label>
                     </div>
                 </div>
+            )}
+
+            {/* V56: Text Tool Panel */}
+            {activeTool === 'text' && (
+                <TextToolPanel
+                    onAdd={handleAddText}
+                    onClose={() => setActiveTool('select')}
+                />
             )}
 
 

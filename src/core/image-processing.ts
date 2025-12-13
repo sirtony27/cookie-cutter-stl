@@ -511,3 +511,112 @@ export const smoothContour = (points: THREE.Vector2[], iterations: number = 2): 
     }
     return currentPoints;
 };
+
+export type TracePresetType = 'logo' | 'sketch' | 'photo';
+
+export interface TracePreset {
+    type: TracePresetType;
+    blur: number;
+    threshold: number;
+    adaptive: boolean;
+    morphology: boolean;
+}
+
+export const analyzeImage = (image: HTMLImageElement): TracePreset => {
+    // 1. Draw small sample to canvas
+    const sampleSize = 64;
+    const canvas = document.createElement('canvas');
+    canvas.width = sampleSize;
+    canvas.height = sampleSize;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return { type: 'logo', blur: 0, threshold: 128, adaptive: false, morphology: false }; // Fallback
+
+    ctx.drawImage(image, 0, 0, sampleSize, sampleSize);
+    const data = ctx.getImageData(0, 0, sampleSize, sampleSize).data;
+    const pixelCount = sampleSize * sampleSize;
+
+    // 2. Metrics
+    let alphaSum = 0;
+    let graySum = 0;
+    let graySqSum = 0;
+
+
+    for (let i = 0; i < pixelCount; i++) {
+        const r = data[i * 4];
+        const g = data[i * 4 + 1];
+        const b = data[i * 4 + 2];
+        const a = data[i * 4 + 3];
+
+        alphaSum += a;
+        const gray = 0.299 * r + 0.587 * g + 0.114 * b;
+        graySum += gray;
+        graySqSum += gray * gray;
+    }
+
+
+    // const meanGray = graySum / pixelCount;
+    // const variance = (graySqSum / pixelCount) - (meanGray * meanGray);
+
+    // 3. Heuristics
+
+    // A. Alpha Check: High transparency -> Likely a Logo/Clipart
+    // If mean alpha < 250 (allowing some softness), it has transparency.
+    // If > 90% transparent, it's empty? No.
+    // Let's check "Ratio of Transparent Pixels".
+    let transparentPixels = 0;
+    for (let i = 0; i < pixelCount; i++) {
+        if (data[i * 4 + 3] < 250) transparentPixels++;
+    }
+    const transparencyRatio = transparentPixels / pixelCount;
+
+    if (transparencyRatio > 0.1) {
+        // >10% transparent -> Probably a Logo/Sticker
+        return {
+            type: 'logo',
+            blur: 0,
+            threshold: 128,
+            adaptive: false,
+            morphology: false
+        };
+    }
+
+    // B. Noise / Variance Check
+    // "Photo" usually has high entropy or high noise. "Sketch" is bimodal (White paper, Black lines).
+    // Let's classify based on simplistic assumptions for now.
+
+    // If it's fully opaque (Paper?), check brightness distribution.
+    // Sketches are mostly bright (white paper).
+    // Photos are middle-toned.
+
+    // Let's use a "Noise" estimation: local variance? 
+    // Or just simple: Defaults to Photo (Blur 2) unless likely Sketch.
+
+    // Sketch Heuristic: High brightness mean (> 200) and high variance?
+    // Actually, simple Bimodal check?
+    // Let's try: "If it looks like a white page with lines" -> Sketch.
+    // Mean Brightness > 200 (Light background).
+
+    const meanBrightness = graySum / pixelCount;
+
+    if (meanBrightness > 180) {
+        // Likely a drawing on white paper
+        return {
+            type: 'sketch',
+            blur: 1, // Slight blur to smooth pencil lines
+            threshold: 100, // Lower threshold for faint lines
+            adaptive: true, // Adaptive helps with uneven lighting on paper
+            morphology: true // Repair broken lines
+        };
+    }
+
+    // Default: Photo / Complex Image
+    return {
+        type: 'photo',
+        blur: 3, // Strong blur to remove noise
+        threshold: 128,
+        adaptive: false, // Standard thresholding usually safer for full photos unless lighting is bad. 
+        // Actually, Adaptive is great for photos too, but slow? 
+        // Let's stick to standard but blurred.
+        morphology: false
+    };
+};
