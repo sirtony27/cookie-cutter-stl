@@ -1,6 +1,6 @@
 
 import { useState, useEffect } from 'react';
-import { Cookie, Wand2, Undo2, Redo2, Upload, Pencil, Type } from 'lucide-react';
+import { Cookie, Wand2, Undo2, Redo2, Upload, Pencil, Type, Shapes, Heart, Star, Circle, FolderOpen, Save } from 'lucide-react';
 import JSZip from 'jszip';
 import { saveAs } from 'file-saver';
 import { Dropzone } from './components/Dropzone';
@@ -11,11 +11,12 @@ import { TextInput } from './components/TextInput';
 import { ContourEditor, type ContourRole } from './components/ContourEditor';
 import { ImageProcessor } from './components/ImageProcessor';
 import { prepareImageForTrace, loadImage, type ProcessOptions, simplifyContour, smoothContour } from './core/image-processing'; // V45: Import prepare
-import { generateGeometry, exportToSTL, type CutterPart } from './core/geometry-generator';
-import type { CutterSettings } from './core/geometry-generator';
+import { generateGeometry, exportToSTL, type CutterPart, type CutterSettings } from './core/geometry-generator';
 import { applyTransformToContour } from './core/transform-utils';
+import { generateCircle, generateHeart, generateStar, generateRectangle } from './core/shape-templates';
 import { FloatingPanel } from './components/FloatingPanel'; // V44
 import TraceWorker from './workers/trace.worker?worker'; // V45: Worker Import
+// import GeometryWorker from './core/geometry.worker?worker'; // Reverted
 import * as THREE from 'three';
 
 const DEFAULT_SETTINGS: CutterSettings = {
@@ -93,6 +94,92 @@ function App() {
     const finalHandles = newHandles || newContours.map((c, i) => contourHandles[i] || new Array(c.length).fill(null));
 
     setDesignState({ contours: newContours, roles: finalRoles, nodeTypes: finalNodeTypes, handles: finalHandles });
+    setIsDirty(true); // V48: Mark as dirty on change
+  };
+
+  // V48: Persistence State
+  const [projectName, setProjectName] = useState<string | null>(null);
+  const [isDirty, setIsDirty] = useState(false);
+
+  // V48: Unload Protection
+  useEffect(() => {
+    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+      if (isDirty) {
+        e.preventDefault();
+        e.returnValue = ''; // Chrome requires returnValue to be set
+      }
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+  }, [isDirty]);
+
+  const handleSaveProject = () => {
+    // Serialize
+    const projectData = {
+      version: "1.0",
+      timestamp: Date.now(),
+      name: projectName || "Mi Proyecto",
+      settings: settings,
+      data: {
+        contours: contours?.map(c => c.map(p => ({ x: p.x, y: p.y }))) || [],
+        roles: contourRoles,
+        nodeTypes: nodeTypes,
+        handles: contourHandles,
+        imageDims: imageDims
+      }
+    };
+
+    const blob = new Blob([JSON.stringify(projectData, null, 2)], { type: "application/json" });
+    let finalName = projectName;
+    if (!finalName) {
+      finalName = prompt("Nombre del proyecto:", "proyecto-cookie-cutter");
+      if (!finalName) return; // Cancelled
+      setProjectName(finalName);
+    }
+
+    saveAs(blob, `${finalName}.ccg`);
+    setIsDirty(false);
+  };
+
+  const handleLoadProject = (file: File) => {
+    if (isDirty) {
+      if (!confirm("Tienes cambios sin guardar. ¿Deseas continuar y perder los cambios actuales?")) return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const json = JSON.parse(e.target?.result as string);
+        if (!json.version || !json.data) throw new Error("Archivo de proyecto inválido");
+
+        // Restore State
+        setSettings(json.settings);
+        setProjectName(json.name);
+
+        const loadedContours = json.data.contours.map((c: any[]) => c.map((p: any) => new THREE.Vector2(p.x, p.y)));
+        const loadedRoles = json.data.roles;
+        const loadedNodeTypes = json.data.nodeTypes;
+        // Handles need rehydration (vector2)
+        const loadedHandles = json.data.handles?.map((hc: any[]) => hc.map((h: any) => h ? { in: new THREE.Vector2(h.in.x, h.in.y), out: new THREE.Vector2(h.out.x, h.out.y) } : null));
+
+        setImageDims(json.data.imageDims);
+        resetAppDesign({
+          contours: loadedContours,
+          roles: loadedRoles,
+          nodeTypes: loadedNodeTypes,
+          handles: loadedHandles
+        });
+
+        setIsDirty(false);
+        setAppMode('cutter'); // Default switch to editor mode
+        setIsNodeEditorMode(true);
+
+      } catch (err) {
+        console.error(err);
+        alert("Error al cargar proyecto: Archivo corrupto o versión incompatible.");
+      }
+    };
+    reader.readAsText(file);
   };
 
   const [appMode, setAppMode] = useState<AppMode | null>(null);
@@ -127,6 +214,9 @@ function App() {
   };
 
   const [geometryParts, setGeometryParts] = useState<CutterPart[]>([]);
+
+  // Initialize Geometry Worker
+  /* Reverted Worker Initialization */
 
   // V34: Lifted Selection State for 3D Sync
   const [selectedIndices, setSelectedIndices] = useState<Set<number>>(new Set());
@@ -187,7 +277,7 @@ function App() {
     updateDesign(newContours);
   };
   // Input Mode
-  const [inputMode, setInputMode] = useState<'upload' | 'text' | 'designer'>('upload');
+  const [inputMode, setInputMode] = useState<'upload' | 'text' | 'designer' | 'templates'>('upload');
 
   // Edit Mode State
   const [isEditMode, setIsEditMode] = useState(false); // Eraser
@@ -253,9 +343,39 @@ function App() {
 
   // Handler for text generation
   // Handler for text generation
+  // Handler for text generation
   const handleTextGenerated = (img: HTMLImageElement) => {
     // Text is usually perfect BW, so standard settings work
     runTrace(img, { blur: 0, threshold: 128, invert: false, mode: 'luminance', highRes: true, adaptive: false, morphology: false });
+  };
+
+  const handleShapeSelect = (type: 'circle' | 'heart' | 'star' | 'rect') => {
+    const canvasSize = 800; // Virtual canvas size
+    const center = new THREE.Vector2(canvasSize / 2, canvasSize / 2);
+    const radius = 150; // Default size
+
+    let points: THREE.Vector2[] = [];
+
+    if (type === 'circle') points = generateCircle(radius);
+    if (type === 'heart') {
+      // Heart needs scale. 
+      // Our formula: ~16 units wide. Radius 150 -> Scale ~10
+      points = generateHeart(9);
+      // Heart formula is around (0,0). Flip Y? 
+      // Usually heart formula is upright Y-up. Our canvas is Y-down?
+      // Let's just create it. Editor flips Y later. 
+    }
+    if (type === 'star') points = generateStar(radius, radius * 0.4, 5);
+    if (type === 'rect') points = generateRectangle(radius * 2, radius * 1.5, 20);
+
+    // Center the points
+    const centeredPoints = points.map(p => new THREE.Vector2(p.x + center.x, p.y + center.y));
+
+    setImageDims({ width: canvasSize, height: canvasSize });
+    resetAppDesign([centeredPoints]);
+    setHiddenPartIds(new Set());
+    setIsNodeEditorMode(true);
+    setProcessingImg(null);
   };
 
   // ...
@@ -378,8 +498,10 @@ function App() {
       return finalContour.map(p => new THREE.Vector2(p.x, -p.y));
     });
 
+    // Reverted to Synchronous Generation
     const parts = generateGeometry(smoothContours, contourRoles, imageDims.width, imageDims.height, settings);
     setGeometryParts(parts);
+
   }, [contours, contourRoles, imageDims, settings, nodeTypes, contourHandles]);
 
 
@@ -472,7 +594,36 @@ function App() {
             </h1>
           </div>
 
+
           <div className="flex items-center gap-3">
+            {/* V48: Persistence UI */}
+            <div className="flex items-center gap-1 mr-2 bg-white/5 rounded-lg p-1 border border-white/5">
+              <button
+                onClick={() => document.getElementById('project-upload')?.click()}
+                className="p-1.5 text-stone-400 hover:text-white hover:bg-white/10 rounded transition-colors"
+                title="Abrir Proyecto (.ccg)"
+              >
+                <FolderOpen className="w-4 h-4" />
+              </button>
+              <input
+                type="file"
+                id="project-upload"
+                accept=".ccg,.json"
+                className="hidden"
+                onChange={(e) => {
+                  if (e.target.files?.[0]) handleLoadProject(e.target.files[0]);
+                  e.target.value = ''; // Reset
+                }}
+              />
+              <button
+                onClick={handleSaveProject}
+                className={`p-1.5 text-stone-400 hover:text-white hover:bg-white/10 rounded transition-colors ${isDirty ? 'text-yellow-400' : ''}`}
+                title={isDirty ? "Guardar Proyecto (Cambios sin guardar)" : "Guardar Proyecto"}
+              >
+                <Save className="w-4 h-4" />
+              </button>
+            </div>
+
             <button
               onClick={() => setIsSidebarOpen(!isSidebarOpen)}
               className={`text-xs px-2 py-1 rounded border transition-colors ${isSidebarOpen ? 'bg-white/10 border-white/10 text-white' : 'border-white/5 text-stone-500 hover:text-white'}`}
@@ -630,6 +781,10 @@ function App() {
                 <p className="font-medium text-lg">Procesando Diseño...</p>
               </div>
             )}
+
+            {/* V47: Geometry Generation Indicator */}
+            {/* V47: Geometry Generation Indicator - Reverted */}
+            {/* isGeneratingGeometry block removed */}
           </div>
 
           {/* Error Message */}
@@ -679,6 +834,14 @@ function App() {
                 >
                   <Type className="w-4 h-4" />
                   <span className="hidden sm:inline">Texto</span>
+                </button>
+                <button
+                  onClick={() => { setInputMode('templates'); resetAppDesign(null); setGeometryParts([]); setReferenceImage(null); }}
+                  className={`flex-1 py-2 rounded-md text-xs md:text-sm font-medium transition-all flex items-center justify-center gap-2
+                            ${inputMode === 'templates' ? 'bg-pink-600 text-white shadow-lg' : 'text-gray-400 hover:text-white hover:bg-white/5'}`}
+                >
+                  <Shapes className="w-4 h-4" />
+                  <span className="hidden sm:inline">Formas</span>
                 </button>
               </div>
             </div>
@@ -746,9 +909,46 @@ function App() {
                     </button>
                   )}
                 </div>
-              ) : (
+              ) : inputMode === 'text' ? (
                 <div className="mt-2">
                   <TextInput onImageGenerated={handleTextGenerated} />
+                </div>
+              ) : (
+                <div className="bg-white/5 border border-white/10 rounded-xl p-6">
+                  <h3 className="text-lg font-bold mb-4 flex items-center gap-2">
+                    <Shapes className="w-5 h-5 text-pink-400" />
+                    Plantillas Rápidas
+                  </h3>
+                  <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                    <button
+                      onClick={() => handleShapeSelect('circle')}
+                      className="aspect-square bg-black/20 hover:bg-white/10 border border-white/5 hover:border-white/20 rounded-xl flex flex-col items-center justify-center gap-3 transition-all group"
+                    >
+                      <Circle className="w-10 h-10 text-stone-500 group-hover:text-blue-400" />
+                      <span className="text-sm font-medium text-stone-400 group-hover:text-white">Círculo</span>
+                    </button>
+                    <button
+                      onClick={() => handleShapeSelect('heart')}
+                      className="aspect-square bg-black/20 hover:bg-white/10 border border-white/5 hover:border-white/20 rounded-xl flex flex-col items-center justify-center gap-3 transition-all group"
+                    >
+                      <Heart className="w-10 h-10 text-stone-500 group-hover:text-pink-400" />
+                      <span className="text-sm font-medium text-stone-400 group-hover:text-white">Corazón</span>
+                    </button>
+                    <button
+                      onClick={() => handleShapeSelect('star')}
+                      className="aspect-square bg-black/20 hover:bg-white/10 border border-white/5 hover:border-white/20 rounded-xl flex flex-col items-center justify-center gap-3 transition-all group"
+                    >
+                      <Star className="w-10 h-10 text-stone-500 group-hover:text-yellow-400" />
+                      <span className="text-sm font-medium text-stone-400 group-hover:text-white">Estrella</span>
+                    </button>
+                    <button
+                      onClick={() => handleShapeSelect('rect')}
+                      className="aspect-square bg-black/20 hover:bg-white/10 border border-white/5 hover:border-white/20 rounded-xl flex flex-col items-center justify-center gap-3 transition-all group"
+                    >
+                      <div className="w-10 h-8 border-2 border-stone-500 rounded group-hover:border-green-400" />
+                      <span className="text-sm font-medium text-stone-400 group-hover:text-white">Rectángulo</span>
+                    </button>
+                  </div>
                 </div>
               )}
             </div>
@@ -756,33 +956,35 @@ function App() {
         </div>
 
         {/* Right Column: Controls (Sidebar) */}
-        {isSidebarOpen && (
-          <div className="w-[340px] flex-shrink-0 h-full overflow-y-auto border-l border-white/5 bg-[#111] custom-scrollbar z-20">
-            <div className="p-4 space-y-6 pb-20">
-              <Controls
-                settings={settings}
-                onChange={setSettings}
-                onExport={handleExport}
-                disabled={geometryParts.length === 0}
-                viewerSettings={viewerSettings}
-                onViewerChange={handleViewerChange}
-                isEditMode={isEditMode}
-                onToggleEditMode={() => setIsEditMode(!isEditMode)}
-                hasHiddenParts={hiddenPartIds.size > 0}
-                onResetHidden={handleResetHidden}
-              />
-              <div className="mt-8 p-6 bg-blue-500/5 border border-blue-500/10 rounded-xl text-sm text-blue-200/80">
-                <p className="font-semibold text-blue-300 mb-2">Características:</p>
-                <ul className="list-disc ml-4 space-y-1 text-gray-400">
-                  <li>Suavizado Automático</li>
-                  <li>Modo Set 2 Piezas</li>
-                  <li>Generador de Texto</li>
-                </ul>
+        {
+          isSidebarOpen && (
+            <div className="w-[340px] flex-shrink-0 h-full overflow-y-auto border-l border-white/5 bg-[#111] custom-scrollbar z-20">
+              <div className="p-4 space-y-6 pb-20">
+                <Controls
+                  settings={settings}
+                  onChange={setSettings}
+                  onExport={handleExport}
+                  disabled={geometryParts.length === 0}
+                  viewerSettings={viewerSettings}
+                  onViewerChange={handleViewerChange}
+                  isEditMode={isEditMode}
+                  onToggleEditMode={() => setIsEditMode(!isEditMode)}
+                  hasHiddenParts={hiddenPartIds.size > 0}
+                  onResetHidden={handleResetHidden}
+                />
+                <div className="mt-8 p-6 bg-blue-500/5 border border-blue-500/10 rounded-xl text-sm text-blue-200/80">
+                  <p className="font-semibold text-blue-300 mb-2">Características:</p>
+                  <ul className="list-disc ml-4 space-y-1 text-gray-400">
+                    <li>Suavizado Automático</li>
+                    <li>Modo Set 2 Piezas</li>
+                    <li>Generador de Texto</li>
+                  </ul>
+                </div>
               </div>
             </div>
-          </div>
-        )}
-      </main>
+          )
+        }
+      </main >
     </div >
   );
 }

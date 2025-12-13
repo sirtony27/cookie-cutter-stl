@@ -1,11 +1,20 @@
 import { useState, useRef, useEffect, type MouseEvent as ReactMouseEvent } from 'react';
 import * as THREE from 'three';
-import { MousePointer2, PenTool, Circle as CircleIcon, Square as SquareIcon, Brush, X, Scissors, Stamp, Wand2, Magnet, Edit, Combine, FileMinus, FilePlus } from 'lucide-react';
+import { MousePointer2, PenTool, Circle as CircleIcon, Square as SquareIcon, Brush, X, Wand2, Magnet, Edit, Heart, Star, Move, FileMinus, FlipHorizontal, FlipVertical, Keyboard } from 'lucide-react';
+import { generateCircle, generateHeart, generateStar, generateRectangle } from '../core/shape-templates';
 import { snapPoint, interpolateContour, sampleBezierPath, type NodeType } from '../core/curve-utils';
-import { unionContours, diffContours, intersectContours } from '../core/boolean-ops';
+
 import { simplifyContour as simplifyContourFn } from '../core/image-processing';
 
 export type ContourRole = 'cut' | 'stamp' | 'auto' | 'base' | 'void';
+
+// V54: Robust getBBox Helper (Explicit Definition)
+const getRobustBBox = (points: THREE.Vector2[]): THREE.Box2 => {
+    const box = new THREE.Box2();
+    if (!points || points.length === 0) return box;
+    points.forEach(p => box.expandByPoint(p));
+    return box;
+};
 
 interface ContourEditorProps {
     contours: THREE.Vector2[][];
@@ -27,6 +36,114 @@ interface ContourEditorProps {
     selectedIndices: Set<number>;
     onSelectionChange: (indices: Set<number>) => void;
 }
+
+
+
+// V50: Dimensions Display
+const SelectionDimensions = ({ selectedIndices, localContours, view }: { selectedIndices: Set<number>, localContours: THREE.Vector2[][], view: { w: number, h: number } }) => {
+    if (selectedIndices.size === 0) return null;
+
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    selectedIndices.forEach(idx => {
+        const c = localContours[idx];
+        if (!c) return;
+        c.forEach(p => {
+            if (p.x < minX) minX = p.x;
+            if (p.y < minY) minY = p.y;
+            if (p.x > maxX) maxX = p.x;
+            if (p.y > maxY) maxY = p.y;
+        });
+    });
+
+    if (minX === Infinity) return null;
+
+    const width = maxX - minX;
+    const height = maxY - minY;
+    // Scale text based on view width to remain readable but not huge
+    const fontSize = Math.max(view.w / 50, 2);
+
+    return (
+        <g className="pointer-events-none">
+            <text x={(minX + maxX) / 2} y={minY - (view.w / 100)} textAnchor="middle" fill="#38bdf8" fontSize={fontSize} fontWeight="bold" style={{ textShadow: '0px 1px 2px black' }}>{Math.round(width)} mm</text>
+            <text x={maxX + (view.w / 100)} y={(minY + maxY) / 2} textAnchor="start" dominantBaseline="middle" fill="#38bdf8" fontSize={fontSize} fontWeight="bold" style={{ textShadow: '0px 1px 2px black' }}>{Math.round(height)} mm</text>
+            <rect x={minX} y={minY} width={width} height={height} fill="none" stroke="#38bdf8" strokeWidth={view.w / 500} strokeDasharray="4 2" opacity={0.6} />
+        </g>
+    );
+};
+
+// V55: Keyboard Shortcuts Guide
+const ShortcutsHelp = ({ onClose }: { onClose: () => void }) => {
+    const sections = [
+        {
+            title: "General",
+            items: [
+                { keys: ["Supr", "Backspace"], desc: "Eliminar selección" },
+                { keys: ["Ctrl", "Z"], desc: "Deshacer" },
+                { keys: ["Ctrl", "Shift", "Z"], desc: "Rehacer" },
+            ]
+        },
+        {
+            title: "Navegación",
+            items: [
+                { keys: ["Espacio", "Drag"], desc: "Mover vista (Pan)" },
+                { keys: ["Rueda"], desc: "Zoom in/out" },
+            ]
+        },
+        {
+            title: "Transformación",
+            items: [
+                { keys: ["Flechas"], desc: "Mover suavemente" },
+                { keys: ["Shift", "Drag"], desc: "Escalar proporcional" },
+            ]
+        },
+        {
+            title: "Edición de Nodos",
+            items: [
+                { keys: ["Doble Click"], desc: "Editar Nodos" },
+                { keys: ["Alt", "Click"], desc: "Suavizar / Afilar curva" },
+            ]
+        }
+    ];
+
+    return (
+        <div className="absolute inset-0 z-[100] bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 text-xs select-none" onClick={onClose}>
+            <div className="bg-zinc-900 border border-white/10 rounded-xl shadow-2xl max-w-sm w-full overflow-hidden" onClick={e => e.stopPropagation()}>
+                <div className="flex items-center justify-between p-3 border-b border-white/10 bg-white/5">
+                    <h3 className="font-bold text-gray-100 flex items-center gap-2">
+                        <Keyboard className="w-4 h-4 text-blue-400" /> Atajos de Teclado
+                    </h3>
+                    <button onClick={onClose} className="text-gray-400 hover:text-white transition-colors">
+                        <X className="w-4 h-4" />
+                    </button>
+                </div>
+                <div className="p-4 space-y-4">
+                    {sections.map((section, idx) => (
+                        <div key={idx}>
+                            <h4 className="text-blue-400 font-bold mb-2 uppercase tracking-wider text-[10px]">{section.title}</h4>
+                            <div className="space-y-1.5">
+                                {section.items.map((item, i) => (
+                                    <div key={i} className="flex justify-between items-center text-gray-300">
+                                        <span>{item.desc}</span>
+                                        <div className="flex gap-1">
+                                            {item.keys.map(k => (
+                                                <span key={k} className="bg-white/10 border border-white/5 rounded px-1.5 py-0.5 font-mono text-[10px] text-gray-200 min-w-[20px] text-center">
+                                                    {k}
+                                                </span>
+                                            ))}
+                                        </div>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    ))}
+                </div>
+                <div className="p-3 bg-white/5 border-t border-white/10 text-center text-gray-500 italic">
+                    Click afuera para cerrar
+                </div>
+            </div>
+        </div>
+    );
+};
 
 export function ContourEditor({
     contours,
@@ -50,7 +167,21 @@ export function ContourEditor({
     // V43: Control Handles for Beziers
     const [localHandles, setLocalHandles] = useState<({ in: THREE.Vector2, out: THREE.Vector2 } | null)[][]>(handles);
 
-    // Ensure handles match contours
+    // V49: Snapping State
+    const [snapEnabled, setSnapEnabled] = useState(false);
+    const gridSize = 10; // Pixels
+
+
+    // Helper: Snap coordinates if enabled
+    const applySnap = (p: THREE.Vector2): THREE.Vector2 => {
+        if (!snapEnabled) return p;
+        return new THREE.Vector2(
+            Math.round(p.x / gridSize) * gridSize,
+            Math.round(p.y / gridSize) * gridSize
+        );
+    };
+
+    // Ensure handles match contoursMatch contours
     useEffect(() => {
         if (localContours.length !== localHandles.length) {
             // Resize handles array
@@ -88,10 +219,15 @@ export function ContourEditor({
     // Tools
     type ToolType = 'select' | 'node' | 'pen' | 'brush' | 'circle' | 'square' | 'wand';
     const [activeTool, setActiveTool] = useState<ToolType>('select');
+    // V55: Shortcuts Modal State
+    const [showShortcuts, setShowShortcuts] = useState(false);
 
     // Selection & Transform (Modified for V34 Multi-Selection)
     // Removed local state: const [selectedIndices, setSelectedIndices] = useState<Set<number>>(new Set());
     const selectedIdx = selectedIndices.size === 1 ? Array.from(selectedIndices)[0] : null;
+
+
+
 
     const [transformState, setTransformState] = useState<{
         mode: 'scale' | 'rotate' | 'move';
@@ -100,7 +236,7 @@ export function ContourEditor({
         startScale: THREE.Vector2; // For reference (1,1)
         startRotation: number;
         handle?: string; // 'tl','tr','bl','br','t','b','l','r','rot'
-        originalContour: THREE.Vector2[]; // Snapshot for diff-based transform
+        originalContours: Map<number, THREE.Vector2[]>; // V52: Snapshot for multi-selection
     } | null>(null);
 
     // Drawing State (Moved up)
@@ -183,12 +319,8 @@ export function ContourEditor({
         return () => clearTimeout(timeoutId);
     }, [activeTool, referenceImage, traceSettings, width, height]);
 
-    // UI Toggles
-    const [snappingEnabled, setSnappingEnabled] = useState(true);
-    const [gridSize, setGridSize] = useState(0); // 0 = off, else size in units
-
-    // Default grid to 10 units?
-    useEffect(() => setGridSize(width / 40 > 5 ? width / 40 : 10), [width]);
+    // UI Toggles - Consolidated in V49
+    // Removed old snappingEnabled/gridSize and effect
 
     // Sync
     useEffect(() => {
@@ -424,21 +556,37 @@ export function ContourEditor({
                     }
                 }
 
-                // Drag Logic (Only if single selection for now)
-                // If we implemented multi-drag, we would iterate selectedIndices
-                if (activeTool === 'select' && !e.shiftKey && selectedIndices.size <= 1) { // Only allow drag if single selection or new single selection
-                    const contour = localContours[clickedContour];
-                    const box = getBBox(contour);
-                    const center = box.getCenter(new THREE.Vector2());
-                    setTransformState({
-                        mode: 'move',
-                        startPos: mousePos.clone(),
-                        originalContour: contour.map(p => p.clone()),
-                        center: center,
-                        handle: 'body',
-                        startScale: new THREE.Vector2(1, 1),
-                        startRotation: 0
+                // Drag Logic (Single or Multi)
+                if (activeTool === 'select' && !e.shiftKey && selectedIndices.has(clickedContour)) {
+                    // V52: Multi-Selection Drag Init
+                    const indicesToDrag = Array.from(selectedIndices);
+
+                    // Calculate Global BBox of all selected
+                    const allPoints: THREE.Vector2[] = [];
+                    const snapshot = new Map<number, THREE.Vector2[]>();
+
+                    indicesToDrag.forEach(idx => {
+                        const c = localContours[idx];
+                        if (c) {
+                            c.forEach(p => allPoints.push(p));
+                            snapshot.set(idx, c.map(p => p.clone()));
+                        }
                     });
+
+                    if (allPoints.length > 0) {
+                        const box = getBBox(allPoints);
+                        const center = box.getCenter(new THREE.Vector2());
+
+                        setTransformState({
+                            mode: 'move',
+                            startPos: mousePos.clone(),
+                            originalContours: snapshot,
+                            center: center,
+                            handle: 'body',
+                            startScale: new THREE.Vector2(1, 1),
+                            startRotation: 0
+                        });
+                    }
                 }
             } else if (!transformState && !draggingNode) {
                 // Deselect if clicking empty space (unless Shift is held?)
@@ -464,13 +612,45 @@ export function ContourEditor({
         }
     };
 
+    // V46: Shape Tool Logic
+    const handleAddShape = (type: 'circle' | 'heart' | 'star' | 'rect') => {
+        const center = new THREE.Vector2(view.x + view.w / 2, view.y + view.h / 2);
+        const size = Math.min(view.w, view.h) * 0.3; // Responsive size relative to view
+
+        let points: THREE.Vector2[] = [];
+
+        if (type === 'circle') points = generateCircle(size / 2);
+        if (type === 'heart') points = generateHeart(size / 30); // Heart scale is different
+        if (type === 'star') points = generateStar(size / 2, size * 0.2, 5);
+        if (type === 'rect') points = generateRectangle(size, size * 0.7, size * 0.1);
+
+        // Center the points
+        const centeredPoints = points.map(p => new THREE.Vector2(p.x + center.x, p.y + center.y));
+
+        const newContours = [...localContours, centeredPoints];
+        const newRoles = [...localRoles, 'auto' as ContourRole];
+
+        // Initialize types and handles for new shape
+        const newTypes = [...localNodeTypes]; // Copy current types array
+        newTypes[newContours.length - 1] = new Array(centeredPoints.length).fill('corner');
+
+        const newHandles = localHandles.map(row => [...(row || [])]);
+        newHandles[newContours.length - 1] = new Array(centeredPoints.length).fill(null);
+
+        update(newContours, newRoles, newTypes, newHandles);
+
+        // Auto select
+        onSelectionChange(new Set([newContours.length - 1]));
+    };
+
     const handleMouseMove = (e: ReactMouseEvent) => {
         const svg = svgRef.current;
         const group = groupRef.current;
         if (!svg) return;
 
         // 0. Transform Gizmo Dragging
-        if (transformState && group && selectedIdx !== null) { // Gizmo only works for single selection
+        const hasSelection = selectedIndices.size > 0;
+        if (transformState && group && hasSelection) { // Gizmo works for single or multi
             const pt = svg.createSVGPoint();
             pt.x = e.clientX;
             pt.y = e.clientY;
@@ -479,54 +659,61 @@ export function ContourEditor({
                 const modelPt = pt.matrixTransform(globalToGroup);
                 const currentPos = new THREE.Vector2(modelPt.x, modelPt.y);
 
-                const original = transformState.originalContour;
+                // V52: Multi-Contour Transform Logic (Applied to all selected)
+                const originalContours = transformState.originalContours;
                 const center = transformState.center;
 
-                let newContour = [...original];
+                // Create copies of current state to mutate
+                const newContours = [...localContours];
 
-                if (transformState.mode === 'move') {
-                    // Offset
-                    const delta = currentPos.clone().sub(transformState.startPos);
-                    newContour = original.map(p => p.clone().add(delta));
-                } else if (transformState.mode === 'scale') {
-                    // Scale based on handle
-                    // Simple implementation: Scale = Distance(Current, Center) / Distance(Start, Center) ?
-                    // Better: Bounding Box scaling.
-                    const startDelta = transformState.startPos.clone().sub(center);
-                    const currentDelta = currentPos.clone().sub(center);
+                // Iterate all selected contours in the snapshot
+                originalContours.forEach((original, idx) => {
+                    let transformed = [...original];
 
-                    let sx = 1, sy = 1;
-                    // Prevent zero division
-                    if (Math.abs(startDelta.x) > 0.001) sx = currentDelta.x / startDelta.x;
-                    if (Math.abs(startDelta.y) > 0.001) sy = currentDelta.y / startDelta.y;
+                    if (transformState.mode === 'move') {
+                        // Offset
+                        const delta = currentPos.clone().sub(transformState.startPos);
+                        transformed = original.map(p => p.clone().add(delta));
+                    } else if (transformState.mode === 'scale') {
+                        const startDelta = transformState.startPos.clone().sub(center);
+                        const currentDelta = currentPos.clone().sub(center);
 
-                    // Constrain based on handle
-                    const h = transformState.handle || '';
-                    if (h === 't' || h === 'b') sx = 1; // Only Y
-                    if (h === 'l' || h === 'r') sy = 1; // Only X
+                        let sx = 1, sy = 1;
+                        if (Math.abs(startDelta.x) > 0.001) sx = currentDelta.x / startDelta.x;
+                        if (Math.abs(startDelta.y) > 0.001) sy = currentDelta.y / startDelta.y;
 
-                    // Apply scale
-                    newContour = original.map(p => {
-                        const rel = p.clone().sub(center);
-                        rel.x *= sx;
-                        rel.y *= sy;
-                        return rel.add(center);
-                    });
-                } else if (transformState.mode === 'rotate') {
-                    // Angle delta
-                    const v1 = transformState.startPos.clone().sub(center);
-                    const v2 = currentPos.clone().sub(center);
-                    const angle = v2.angle() - v1.angle();
+                        const h = transformState.handle || '';
+                        if (e.shiftKey) { // Uniform
+                            if (h === 'l' || h === 'r') sy = sx;
+                            else if (h === 't' || h === 'b') sx = sy;
+                            else {
+                                const s = Math.abs(sx) > Math.abs(sy) ? sx : sy;
+                                sx = s; sy = s;
+                            }
+                        } else { // Non-Uniform
+                            if (h === 't' || h === 'b') sx = 1;
+                            if (h === 'l' || h === 'r') sy = 1;
+                        }
 
-                    newContour = original.map(p => {
-                        return p.clone().rotateAround(center, angle);
-                    });
-                }
+                        // Apply scale relative to Group Center
+                        transformed = original.map(p => {
+                            const rel = p.clone().sub(center);
+                            rel.x *= sx;
+                            rel.y *= sy;
+                            return rel.add(center);
+                        });
+                    } else if (transformState.mode === 'rotate') { // V53: Group Rotation
+                        const v1 = transformState.startPos.clone().sub(center);
+                        const v2 = currentPos.clone().sub(center);
+                        const angle = v2.angle() - v1.angle();
+                        transformed = original.map(p => p.clone().rotateAround(center, angle));
+                    }
 
-                // Update Local Contours
-                const nextContours = [...localContours];
-                nextContours[selectedIdx] = newContour;
-                setLocalContours(nextContours);
+                    newContours[idx] = transformed;
+                });
+
+                // Batch Update
+                setLocalContours(newContours);
             }
             return;
         }
@@ -597,7 +784,7 @@ export function ContourEditor({
                 // SNAPPING LOGIC
                 const isShift = e.shiftKey; // Shift toggles snapping (inverted?)
                 // Usually Shift disables snapping if enabled by default
-                const shouldSnap = snappingEnabled ? !isShift : isShift;
+                const shouldSnap = snapEnabled ? !isShift : isShift;
 
                 if (shouldSnap) {
                     // Collect candidate points
@@ -609,9 +796,18 @@ export function ContourEditor({
                         });
                     });
 
-                    const snapRes = snapPoint(currentPos, candidates, gridSize, view.w / 50, true);
-                    if (snapRes.snapped) {
-                        currentPos = snapRes.pos;
+                    // V49: Grid Snapping Logic
+                    const snapped = applySnap(currentPos);
+                    // Override with grid snap (priority over point snap for now)
+                    if (snapped.x !== currentPos.x || snapped.y !== currentPos.y) {
+                        currentPos.x = snapped.x;
+                        currentPos.y = snapped.y;
+                    } else {
+                        // Fallback to point snap (if we implement object snapping later)
+                        const snapRes = snapPoint(currentPos, candidates, gridSize, view.w / 50, true);
+                        if (snapRes.snapped) {
+                            currentPos = snapRes.pos;
+                        }
                     }
                 }
 
@@ -719,7 +915,7 @@ export function ContourEditor({
     // Transform Gizmo Initialization
     const initTransform = (mode: 'scale' | 'rotate' | 'move', handle: string, e: ReactMouseEvent) => {
         e.stopPropagation();
-        if (selectedIdx === null) return; // Gizmo only works for single selection
+        if (selectedIndices.size === 0) return; // Allow multi-selection
 
         const svg = svgRef.current;
         const group = groupRef.current;
@@ -733,19 +929,33 @@ export function ContourEditor({
         const modelPt = pt.matrixTransform(globalToGroup);
         const startPos = new THREE.Vector2(modelPt.x, modelPt.y);
 
-        const contour = localContours[selectedIdx];
-        const bbox = getBBox(contour);
-        const center = new THREE.Vector2();
-        bbox.getCenter(center);
+        // Multi-Selection Init for Gizmo Handle
+        const indicesToDrag = Array.from(selectedIndices);
+        const snapshot = new Map<number, THREE.Vector2[]>();
+        const allPoints: THREE.Vector2[] = [];
+
+        indicesToDrag.forEach(idx => {
+            const c = localContours[idx];
+            if (c) {
+                c.forEach(p => allPoints.push(p));
+                snapshot.set(idx, c.map(p => p.clone()));
+            }
+        });
+
+        // If for some reason allPoints is empty (shouldn't happen if selectedIdx matches), fallback
+        if (allPoints.length === 0) return;
+
+        const box = getRobustBBox(allPoints);
+        const groupCenter = box.getCenter(new THREE.Vector2());
 
         setTransformState({
             mode,
             startPos,
-            center,
+            center: groupCenter,
             startScale: new THREE.Vector2(1, 1),
             startRotation: 0,
             handle,
-            originalContour: [...contour]
+            originalContours: snapshot
         });
     };
 
@@ -825,7 +1035,8 @@ export function ContourEditor({
         const globalToGroup = group.getScreenCTM()?.inverse();
         if (!globalToGroup) return;
         const modelPt = pt.matrixTransform(globalToGroup);
-        const newPt = new THREE.Vector2(modelPt.x, modelPt.y);
+        // V49: Snap Pen Input
+        const newPt = applySnap(new THREE.Vector2(modelPt.x, modelPt.y));
 
         if (pendingContour.length > 2) {
             const first = pendingContour[0];
@@ -947,32 +1158,41 @@ export function ContourEditor({
 
     // Render Gizmo
     const renderGizmo = () => {
-        if (selectedIdx === null || !localContours[selectedIdx]) return null; // Only render for single selection
-        const contour = localContours[selectedIdx];
-        if (contour.length === 0) return null;
+        if (selectedIndices.size === 0) return null; // Render if anything selected
 
-        const bbox = getBBox(contour);
+        // Calculate Group BBox
+        let allPoints: THREE.Vector2[] = [];
+        selectedIndices.forEach(idx => {
+            if (localContours[idx]) {
+                allPoints = allPoints.concat(localContours[idx]);
+            }
+        });
+        if (allPoints.length === 0) return null;
+
+        const bbox = getRobustBBox(allPoints);
         const min = bbox.min;
         const max = bbox.max;
-        const size = new THREE.Vector2();
-        bbox.getSize(size);
-        const w = size.x;
-        const h = size.y;
+        const w = max.x - min.x;
+        const h = max.y - min.y; // Standard Cartesian (Y up? No, Y down usually in SVG but we use min/max)
+        // Actually getBBox returns THREE.Box2.
+        // If Y is down (SVG), min.y is top, max.y is bottom.
+        // getBBox uses Math.min/max.
 
-        // Prevent crash on zero-size (single point)
+        // Prevent crash on zero-size
         if (w === 0 && h === 0) return null;
 
         const handleSize = view.w / 60;
 
         // Handle Positions
+        // Using standard naming: tl (top-left), tr (top-right), etc.
         const handles = [
-            { id: 'tl', x: min.x, y: max.y, c: 'nw-resize' },
-            { id: 't', x: min.x + w / 2, y: max.y, c: 'n-resize' },
-            { id: 'tr', x: max.x, y: max.y, c: 'ne-resize' },
+            { id: 'tl', x: min.x, y: min.y, c: 'nw-resize' },
+            { id: 't', x: min.x + w / 2, y: min.y, c: 'n-resize' },
+            { id: 'tr', x: max.x, y: min.y, c: 'ne-resize' },
             { id: 'r', x: max.x, y: min.y + h / 2, c: 'e-resize' },
-            { id: 'br', x: max.x, y: min.y, c: 'se-resize' },
-            { id: 'b', x: min.x + w / 2, y: min.y, c: 's-resize' },
-            { id: 'bl', x: min.x, y: min.y, c: 'sw-resize' },
+            { id: 'br', x: max.x, y: max.y, c: 'se-resize' },
+            { id: 'b', x: min.x + w / 2, y: max.y, c: 's-resize' },
+            { id: 'bl', x: min.x, y: max.y, c: 'sw-resize' },
             { id: 'l', x: min.x, y: min.y + h / 2, c: 'w-resize' },
         ];
 
@@ -984,9 +1204,10 @@ export function ContourEditor({
                     vectorEffect="non-scaling-stroke"
                 />
 
-                <line x1={min.x + w / 2} y1={max.y} x2={min.x + w / 2} y2={max.y + view.w / 15} stroke="#fbbf24" strokeWidth={view.w / 500} />
+                {/* Rotation Handle (Top) */}
+                <line x1={min.x + w / 2} y1={min.y} x2={min.x + w / 2} y2={min.y - view.w / 15} stroke="#fbbf24" strokeWidth={view.w / 500} />
                 <circle
-                    cx={min.x + w / 2} cy={max.y + view.w / 15} r={handleSize}
+                    cx={min.x + w / 2} cy={min.y - view.w / 15} r={handleSize}
                     fill="white" stroke="#fbbf24" strokeWidth={view.w / 500}
                     className="cursor-alias"
                     onMouseDown={(e) => initTransform('rotate', 'rot', e)}
@@ -1030,288 +1251,239 @@ export function ContourEditor({
                     <ToolButton tool="pen" icon={PenTool} label="Pluma (P)" />
                     <ToolButton tool="wand" icon={Wand2} label="Varita Mágica (W)" />
                     <div className="w-full h-px bg-white/10 my-0.5" />
-                    <ToolButton tool="circle" icon={CircleIcon} label="Círculo" />
-                    <ToolButton tool="square" icon={SquareIcon} label="Cuadrado" />
+                    <ToolButton tool="circle" icon={CircleIcon} label="Dibujar Círculo" />
+                    <ToolButton tool="square" icon={SquareIcon} label="Dibujar Cuadrado" />
                     <div className="w-full h-px bg-white/10 my-0.5" />
-                    {/* Snapping Toggle */}
-                    <button
-                        onClick={(e) => { e.stopPropagation(); setSnappingEnabled(!snappingEnabled); }}
-                        className={`p-2 rounded transition-colors ${snappingEnabled ? 'bg-purple-600 text-white' : 'text-stone-400 hover:text-white hover:bg-white/10'}`}
-                        title="Magnetismo (Snapping)"
-                    >
-                        <Magnet className="w-5 h-5" />
-                    </button>
-                </div>
 
-                <div className="bg-black/60 backdrop-blur text-xs px-3 py-2 rounded text-stone-300 pointer-events-none max-w-[200px] border border-white/5">
-                    {activeTool === 'select' && (
-                        <>
-                            <div className="font-bold mb-1 text-blue-300">Modo Transformar</div>
-                            • Click: Seleccionar<br />
-                            • Arrastrar: Mover Forma<br />
-                            • Doble Clic: Editar Nodos
-                        </>
-                    )}
-                    {activeTool === 'node' && (
-                        <>
-                            <div className="font-bold mb-1 text-green-300">Modo Nodos</div>
-                            • Mover: Arrastrar Punto<br />
-                            • +/- Nodo: Doble Clic<br />
-                            • Tipo: <b>Alt + Clic</b>
-                        </>
-                    )}
-                    {activeTool === 'pen' && (
-                        <>
-                            <div className="font-bold mb-1 text-purple-300">Modo Pluma</div>
-                            • Click: Añadir punto<br />
-                            • Click Inicial: Cerrar
-                        </>
-                    )}
-                    {activeTool === 'wand' && (
-                        <>
-                            <div className="font-bold mb-1 text-cyan-300">Varita Mágica</div>
-                            • Click en "fantasma" para calcar.<br />
-                            • Ajusta el umbral si no ves tu forma.
-                        </>
-                    )}
-                </div>
-
-                {/* Wand Settings Panel */}
-                {activeTool === 'wand' && (
-
-                    <div className="bg-black/90 backdrop-blur rounded p-2 flex flex-col gap-2 border border-white/10 shadow-xl w-64 text-xs text-stone-300" onMouseDown={e => e.stopPropagation()}>
-                        <div className="font-bold text-center text-cyan-400 mb-1 border-b border-white/10 pb-1">MAGIC WAND v2</div>
-
-                        {/* V39: Detection Mode Toggle */}
-                        <div className="flex flex-col gap-1">
-                            <span className="text-[10px] uppercase font-bold tracking-wider text-gray-500">Modo de Detección</span>
-                            <div className="flex bg-white/5 p-1 rounded-lg border border-white/10">
-                                <button
-                                    onClick={() => setTraceSettings(s => ({ ...s, adaptive: false, morphology: false, blur: 2, threshold: 128 }))}
-                                    className={`flex-1 py-1.5 rounded text-[10px] font-medium transition-all ${!traceSettings.adaptive ? 'bg-blue-600 text-white shadow' : 'text-gray-400 hover:text-white'}`}
-                                >
-                                    Logos / Personajes
-                                </button>
-                                <button
-                                    onClick={() => setTraceSettings(s => ({ ...s, adaptive: true, morphology: true, blur: 0, threshold: 128 }))}
-                                    className={`flex-1 py-1.5 rounded text-[10px] font-medium transition-all ${traceSettings.adaptive ? 'bg-purple-600 text-white shadow' : 'text-gray-400 hover:text-white'}`}
-                                >
-                                    Texto Avanzado
-                                </button>
-                            </div>
-                        </div>
-
-                        {/* Presets (Secondary) */}
-                        <div className="flex flex-col gap-1">
-                            <label className="text-gray-500 text-[10px] font-bold">Presets Adicionales:</label>
-                            <select
-                                className="bg-white/5 border border-white/20 rounded px-2 py-1.5 text-white outline-none focus:border-cyan-500 transition-colors text-xs"
-                                value={wizardPreset}
-                                onChange={(e) => {
-                                    const p = e.target.value as WizardPreset;
-                                    setWizardPreset(p);
-                                    // Apply Preset Logic
-                                    switch (p) {
-                                        case 'text':
-                                            // Text preset now enables adaptive!
-                                            setTraceSettings(s => ({ ...s, mode: 'luminance', highRes: true, blur: 0, threshold: 128, adaptive: true, morphology: true }));
-                                            break;
-                                        case 'sketch':
-                                            setTraceSettings(s => ({ ...s, mode: 'edges', highRes: true, blur: 2, threshold: 40, adaptive: false, morphology: false }));
-                                            break;
-                                        case 'shapes':
-                                            setTraceSettings(s => ({ ...s, mode: 'luminance', highRes: false, blur: 5, threshold: 128, adaptive: false, morphology: false }));
-                                            break;
-                                        case 'general':
-                                        default:
-                                            setTraceSettings(s => ({ ...s, mode: 'luminance', highRes: false, blur: 2, threshold: 128, adaptive: false, morphology: false }));
-                                            break;
-                                    }
-                                }}
-                            >
-                                <option value="general">General (Estándar)</option>
-                                <option value="text">Texto / Logotipos (HD)</option>
-                                <option value="sketch">Dibujo / Boceto (Bordes)</option>
-                                <option value="shapes">Formas Básicas (Suave)</option>
-                            </select>
-                        </div>
-
-                        {/* Advanced Controls (Collapsible or Always Visible?) - Always visible for PRO feel */}
-                        <div className="flex flex-col gap-2 pt-2 border-t border-white/10 mt-1">
-                            {/* Blur Control */}
-                            <div className="flex flex-col gap-1">
-                                <label className="flex justify-between text-[10px] text-stone-500">
-                                    <span>Suavizado (Blur)</span>
-                                    <span className="text-white font-mono">{traceSettings.blur}px</span>
-                                </label>
-                                <input
-                                    type="range" min="0" max="10"
-                                    value={traceSettings.blur}
-                                    onChange={(e) => {
-                                        setTraceSettings(p => ({ ...p, blur: parseInt(e.target.value) }));
-                                        setWizardPreset('general'); // Switch to custom/general if manual tweak
-                                    }}
-                                    className="accent-cyan-500 w-full h-1 bg-white/10 rounded-lg appearance-none cursor-pointer"
-                                />
-                            </div>
-
-                            {/* Mode Specific Threshold */}
-                            {traceSettings.mode === 'luminance' && (
-                                <div className="flex flex-col gap-1">
-                                    <label className="flex justify-between text-stone-400">
-                                        <span>Umbral (Brillo)</span>
-                                        <span className="text-white font-mono">{traceSettings.threshold}</span>
-                                    </label>
-                                    <input
-                                        type="range" min="0" max="255"
-                                        value={traceSettings.threshold}
-                                        onChange={(e) => setTraceSettings(p => ({ ...p, threshold: parseInt(e.target.value) }))}
-                                        className="accent-cyan-500 w-full h-1 bg-white/10 rounded-lg appearance-none cursor-pointer"
-                                    />
-                                    <div className="flex justify-between text-[10px] text-stone-500 px-1">
-                                        <span>Oscuro</span>
-                                        <span>Claro</span>
-                                    </div>
-                                </div>
-                            )}
-
-                            {traceSettings.mode === 'edges' && (
-                                <div className="flex flex-col gap-1">
-                                    <label className="flex justify-between text-purple-300">
-                                        <span>Sensibilidad Bordes</span>
-                                        <span className="text-white font-mono">{traceSettings.threshold}</span>
-                                    </label>
-                                    <input
-                                        type="range" min="10" max="200"
-                                        value={traceSettings.threshold}
-                                        onChange={(e) => setTraceSettings(p => ({ ...p, threshold: parseInt(e.target.value) }))}
-                                        className="accent-purple-500 w-full h-1 bg-white/10 rounded-lg appearance-none cursor-pointer"
-                                    />
-                                </div>
-                            )}
-                        </div>
-
-                        <div className="flex flex-col gap-2 mt-2 pt-2 border-t border-white/10">
-                            <label className="flex items-center gap-2 cursor-pointer hover:text-white transition-colors">
-                                <input
-                                    type="checkbox"
-                                    checked={traceSettings.invert}
-                                    onChange={(e) => setTraceSettings(p => ({ ...p, invert: e.target.checked }))}
-                                    className="rounded bg-white/10 border-white/20 text-cyan-500 focus:ring-0 focus:ring-offset-0"
-                                />
-                                Invertir Selección
-                            </label>
-
-                            <label className="flex items-center gap-2 cursor-pointer hover:text-white transition-colors">
-                                <input
-                                    type="checkbox"
-                                    checked={traceSettings.highRes}
-                                    onChange={(e) => setTraceSettings(p => ({ ...p, highRes: e.target.checked }))}
-                                    className="rounded bg-white/10 border-white/20 text-purple-500 focus:ring-0 focus:ring-offset-0"
-                                />
-                                <span className={traceSettings.highRes ? "text-purple-300 font-bold" : ""}>Alta Resolución (HQ)</span>
-                            </label>
+                    {/* Shape Templates */}
+                    <div className="flex flex-col gap-1">
+                        <span className="text-[9px] uppercase font-bold text-gray-500 text-center">Formas</span>
+                        <div className="grid grid-cols-2 gap-1">
+                            <button onClick={() => handleAddShape('circle')} className="p-1.5 rounded hover:bg-white/10 text-stone-400 hover:text-white" title="Insertar Círculo"><CircleIcon className="w-4 h-4" /></button>
+                            <button onClick={() => handleAddShape('heart')} className="p-1.5 rounded hover:bg-white/10 text-stone-400 hover:text-pink-400" title="Insertar Corazón"><Heart className="w-4 h-4" /></button>
+                            <button onClick={() => handleAddShape('star')} className="p-1.5 rounded hover:bg-white/10 text-stone-400 hover:text-yellow-400" title="Insertar Estrella"><Star className="w-4 h-4" /></button>
+                            <button onClick={() => handleAddShape('rect')} className="p-1.5 rounded hover:bg-white/10 text-stone-400 hover:text-green-400" title="Insertar Rectángulo"><SquareIcon className="w-4 h-4" /></button>
                         </div>
                     </div>
+                </div>
+            </div>
+
+            <div className="bg-black/80 backdrop-blur text-xs px-3 py-2 rounded text-stone-300 pointer-events-none max-w-[200px] border border-white/5 absolute top-2 left-1/2 -translate-x-1/2 z-10 text-center shadow-lg">
+                {activeTool === 'select' && (
+                    <>
+                        <div className="font-bold mb-1 text-blue-300">Modo Transformar</div>
+                        • Click: Seleccionar<br />
+                        • Arrastrar: Mover Forma<br />
+                        • Doble Clic: Editar Nodos
+                    </>
+                )}
+                {activeTool === 'node' && (
+                    <>
+                        <div className="font-bold mb-1 text-green-300">Modo Nodos</div>
+                        • Mover: Arrastrar Punto<br />
+                        • +/- Nodo: Doble Clic<br />
+                        • Tipo: <b>Alt + Clic</b>
+                    </>
+                )}
+                {activeTool === 'pen' && (
+                    <>
+                        <div className="font-bold mb-1 text-purple-300">Modo Pluma</div>
+                        • Click: Añadir punto<br />
+                        • Click Inicial: Cerrar
+                    </>
+                )}
+                {activeTool === 'wand' && (
+                    <>
+                        <div className="font-bold mb-1 text-cyan-300">Varita Mágica</div>
+                        • Click en "fantasma" para calcar.<br />
+                        • Ajusta el umbral si no ves tu forma.
+                    </>
                 )}
             </div>
+
+            {/* Wand Settings Panel */}
+            {activeTool === 'wand' && (
+
+                <div className="absolute bottom-20 left-4 bg-black/90 backdrop-blur rounded p-2 flex flex-col gap-2 border border-white/10 shadow-xl w-64 text-xs text-stone-300 z-50" onMouseDown={e => e.stopPropagation()}>
+                    <div className="font-bold text-center text-cyan-400 mb-1 border-b border-white/10 pb-1">MAGIC WAND v2</div>
+
+                    {/* V39: Detection Mode Toggle */}
+                    <div className="flex flex-col gap-1">
+                        <span className="text-[10px] uppercase font-bold tracking-wider text-gray-500">Modo de Detección</span>
+                        <div className="flex bg-white/5 p-1 rounded-lg border border-white/10">
+                            <button
+                                onClick={() => setTraceSettings(s => ({ ...s, adaptive: false, morphology: false, blur: 2, threshold: 128 }))}
+                                className={`flex-1 py-1.5 rounded text-[10px] font-medium transition-all ${!traceSettings.adaptive ? 'bg-blue-600 text-white shadow' : 'text-gray-400 hover:text-white'}`}
+                            >
+                                Logos / Personajes
+                            </button>
+                            <button
+                                onClick={() => setTraceSettings(s => ({ ...s, adaptive: true, morphology: true, blur: 0, threshold: 128 }))}
+                                className={`flex-1 py-1.5 rounded text-[10px] font-medium transition-all ${traceSettings.adaptive ? 'bg-purple-600 text-white shadow' : 'text-gray-400 hover:text-white'}`}
+                            >
+                                Texto Avanzado
+                            </button>
+                        </div>
+                    </div>
+
+                    {/* Presets (Secondary) */}
+                    <div className="flex flex-col gap-1">
+                        <label className="text-gray-500 text-[10px] font-bold">Presets Adicionales:</label>
+                        <select
+                            className="bg-white/5 border border-white/20 rounded px-2 py-1.5 text-white outline-none focus:border-cyan-500 transition-colors text-xs"
+                            value={wizardPreset}
+                            onChange={(e) => {
+                                const p = e.target.value as WizardPreset;
+                                setWizardPreset(p);
+                                // Apply Preset Logic
+                                switch (p) {
+                                    case 'text':
+                                        // Text preset now enables adaptive!
+                                        setTraceSettings(s => ({ ...s, mode: 'luminance', highRes: true, blur: 0, threshold: 128, adaptive: true, morphology: true }));
+                                        break;
+                                    case 'sketch':
+                                        setTraceSettings(s => ({ ...s, mode: 'edges', highRes: true, blur: 2, threshold: 40, adaptive: false, morphology: false }));
+                                        break;
+                                    case 'shapes':
+                                        setTraceSettings(s => ({ ...s, mode: 'luminance', highRes: false, blur: 5, threshold: 128, adaptive: false, morphology: false }));
+                                        break;
+                                    case 'general':
+                                    default:
+                                        setTraceSettings(s => ({ ...s, mode: 'luminance', highRes: false, blur: 2, threshold: 128, adaptive: false, morphology: false }));
+                                        break;
+                                }
+                            }}
+                        >
+                            <option value="general">General (Estándar)</option>
+                            <option value="text">Texto / Logotipos (HD)</option>
+                            <option value="sketch">Dibujo / Boceto (Bordes)</option>
+                            <option value="shapes">Formas Básicas (Suave)</option>
+                        </select>
+                    </div>
+
+                    {/* Advanced Controls (Collapsible or Always Visible?) - Always visible for PRO feel */}
+                    <div className="flex flex-col gap-2 pt-2 border-t border-white/10 mt-1">
+                        {/* Blur Control */}
+                        <div className="flex flex-col gap-1">
+                            <label className="flex justify-between text-[10px] text-stone-500">
+                                <span>Suavizado (Blur)</span>
+                                <span className="text-white font-mono">{traceSettings.blur}px</span>
+                            </label>
+                            <input
+                                type="range" min="0" max="10"
+                                value={traceSettings.blur}
+                                onChange={(e) => {
+                                    setTraceSettings(p => ({ ...p, blur: parseInt(e.target.value) }));
+                                    setWizardPreset('general'); // Switch to custom/general if manual tweak
+                                }}
+                                className="accent-cyan-500 w-full h-1 bg-white/10 rounded-lg appearance-none cursor-pointer"
+                            />
+                        </div>
+
+                        {/* Mode Specific Threshold */}
+                        {traceSettings.mode === 'luminance' && (
+                            <div className="flex flex-col gap-1">
+                                <label className="flex justify-between text-stone-400">
+                                    <span>Umbral (Brillo)</span>
+                                    <span className="text-white font-mono">{traceSettings.threshold}</span>
+                                </label>
+                                <input
+                                    type="range" min="0" max="255"
+                                    value={traceSettings.threshold}
+                                    onChange={(e) => setTraceSettings(p => ({ ...p, threshold: parseInt(e.target.value) }))}
+                                    className="accent-cyan-500 w-full h-1 bg-white/10 rounded-lg appearance-none cursor-pointer"
+                                />
+                                <div className="flex justify-between text-[10px] text-stone-500 px-1">
+                                    <span>Oscuro</span>
+                                    <span>Claro</span>
+                                </div>
+                            </div>
+                        )}
+
+                        {traceSettings.mode === 'edges' && (
+                            <div className="flex flex-col gap-1">
+                                <label className="flex justify-between text-purple-300">
+                                    <span>Sensibilidad Bordes</span>
+                                    <span className="text-white font-mono">{traceSettings.threshold}</span>
+                                </label>
+                                <input
+                                    type="range" min="10" max="200"
+                                    value={traceSettings.threshold}
+                                    onChange={(e) => setTraceSettings(p => ({ ...p, threshold: parseInt(e.target.value) }))}
+                                    className="accent-purple-500 w-full h-1 bg-white/10 rounded-lg appearance-none cursor-pointer"
+                                />
+                            </div>
+                        )}
+                    </div>
+
+                    <div className="flex flex-col gap-2 mt-2 pt-2 border-t border-white/10">
+                        <label className="flex items-center gap-2 cursor-pointer hover:text-white transition-colors">
+                            <input
+                                type="checkbox"
+                                checked={traceSettings.invert}
+                                onChange={(e) => setTraceSettings(p => ({ ...p, invert: e.target.checked }))}
+                                className="rounded bg-white/10 border-white/20 text-cyan-500 focus:ring-0 focus:ring-offset-0"
+                            />
+                            Invertir Selección
+                        </label>
+
+                        <label className="flex items-center gap-2 cursor-pointer hover:text-white transition-colors">
+                            <input
+                                type="checkbox"
+                                checked={traceSettings.highRes}
+                                onChange={(e) => setTraceSettings(p => ({ ...p, highRes: e.target.checked }))}
+                                className="rounded bg-white/10 border-white/20 text-purple-500 focus:ring-0 focus:ring-offset-0"
+                            />
+                            <span className={traceSettings.highRes ? "text-purple-300 font-bold" : ""}>Alta Resolución (HQ)</span>
+                        </label>
+                    </div>
+                </div>
+            )}
+
 
             {/* Fullscreen Toggle Removed */}
 
             {/* Boolean Toolbar (Only when >1 selected) */}
-            {selectedIndices.size > 1 && (
-                <div className="absolute bottom-4 left-1/2 -translate-x-1/2 bg-black/90 backdrop-blur-xl border border-white/10 rounded-xl p-2 flex gap-2 z-50 shadow-2xl">
-                    <button
-                        className="px-3 py-2 bg-white/5 hover:bg-white/10 rounded flex items-center gap-2 text-sm text-gray-200 hover:text-white transition"
-                        title="Unir Formas (Unión)"
-                        onClick={(e) => {
-                            e.stopPropagation();
-                            const indices = Array.from(selectedIndices).sort((a, b) => b - a); // Desc order to delete safely
-                            if (indices.length < 2) return;
-
-                            // For simplicity, union the first two selected contours.
-                            // A more robust solution would involve iteratively combining all selected.
-                            const c1 = localContours[indices[1]]; // Smaller index
-                            const c2 = localContours[indices[0]]; // Larger index
-
-                            const res = unionContours(c1, c2);
-
-                            // Remove old
-                            const newC = localContours.filter((_, i) => i !== indices[0] && i !== indices[1]);
-                            const newR = localRoles.filter((_, i) => i !== indices[0] && i !== indices[1]);
-                            const newT = localNodeTypes.filter((_, i) => i !== indices[0] && i !== indices[1]);
-
-                            // Add new (res is Vector2[][])
-                            const addedC = [...newC, ...res];
-                            const addedR = [...newR, ...res.map(() => 'auto' as ContourRole)];
-                            const addedT = [...newT, ...res.map(c => new Array(c.length).fill('corner'))];
-
-                            update(addedC, addedR, addedT);
-                            onSelectionChange(new Set([addedC.length - 1])); // Select last result
-                        }}
+            {
+                selectedIndices.size > 1 && (
+                    <div
+                        className="absolute bottom-4 left-1/2 -translate-x-1/2 bg-black/90 backdrop-blur-xl border border-white/10 rounded-xl p-2 flex gap-2 z-50 shadow-2xl"
+                        onMouseDown={(e) => e.stopPropagation()}
                     >
-                        <Combine className="w-4 h-4" /> Unir
-                    </button>
-                    <button
-                        className="px-3 py-2 bg-white/5 hover:bg-white/10 rounded flex items-center gap-2 text-sm text-gray-200 hover:text-white transition"
-                        title="Restar (Último - Primero)"
-                        onClick={(e) => {
-                            e.stopPropagation();
-                            const order = Array.from(selectedIndices); // Order of selection matters for difference
-                            if (order.length < 2) return;
+                        <button
+                            className="px-3 py-2 bg-white/5 hover:bg-white/10 rounded flex items-center gap-2 text-sm text-gray-200 hover:text-white transition group border border-transparent hover:border-white/10"
+                            title="Centrar Todo"
+                            onClick={(e) => {
+                                e.stopPropagation();
+                                // V53: Align Center Logic
+                                const indices = Array.from(selectedIndices);
+                                const allPoints: THREE.Vector2[] = [];
+                                indices.forEach(idx => {
+                                    localContours[idx].forEach(p => allPoints.push(p));
+                                });
 
-                            // Convention: Subtract the second selected from the first selected.
-                            const subject = localContours[order[0]];
-                            const clipper = localContours[order[1]];
+                                if (allPoints.length === 0) return;
 
-                            const res = diffContours(subject, clipper);
+                                const groupBBox = getRobustBBox(allPoints);
+                                const groupCenter = groupBBox.getCenter(new THREE.Vector2());
 
-                            // Remove old
-                            const newC = localContours.filter((_, i) => !selectedIndices.has(i));
-                            const newR = localRoles.filter((_, i) => !selectedIndices.has(i));
-                            const newT = localNodeTypes.filter((_, i) => !selectedIndices.has(i));
+                                const newContours = [...localContours];
+                                indices.forEach(idx => {
+                                    const c = newContours[idx];
+                                    const box = getRobustBBox(c);
+                                    const localCenter = box.getCenter(new THREE.Vector2());
+                                    const delta = groupCenter.clone().sub(localCenter);
+                                    newContours[idx] = c.map(p => p.clone().add(delta));
+                                });
 
-                            // Add new
-                            const addedC = [...newC, ...res];
-                            const addedR = [...newR, ...res.map(() => 'auto' as ContourRole)];
-                            const addedT = [...newT, ...res.map(c => new Array(c.length).fill('corner'))];
-
-                            update(addedC, addedR, addedT);
-                            onSelectionChange(new Set(res.map((_, i) => newC.length + i)));
-                        }}
-                    >
-                        <FileMinus className="w-4 h-4" /> Restar
-                    </button>
-                    <button
-                        className="px-3 py-2 bg-white/5 hover:bg-white/10 rounded flex items-center gap-2 text-sm text-gray-200 hover:text-white transition"
-                        title="Intersección"
-                        onClick={(e) => {
-                            e.stopPropagation();
-                            const order = Array.from(selectedIndices);
-                            if (order.length < 2) return;
-                            const subject = localContours[order[0]];
-                            const clipper = localContours[order[1]];
-
-                            const res = intersectContours(subject, clipper);
-
-                            // Remove old
-                            const newC = localContours.filter((_, i) => !selectedIndices.has(i));
-                            const newR = localRoles.filter((_, i) => !selectedIndices.has(i));
-                            const newT = localNodeTypes.filter((_, i) => !selectedIndices.has(i));
-
-                            // Add new
-                            const addedC = [...newC, ...res];
-                            const addedR = [...newR, ...res.map(() => 'auto' as ContourRole)];
-                            const addedT = [...newT, ...res.map(c => new Array(c.length).fill('corner'))];
-
-                            update(addedC, addedR, addedT);
-                            onSelectionChange(new Set(res.map((_, i) => newC.length + i)));
-                        }}
-                    >
-                        <FilePlus className="w-4 h-4" /> Intersección
-                    </button>
-                </div>
-            )}
+                                update(newContours, localRoles, localNodeTypes);
+                            }}
+                        >
+                            <Move className="w-4 h-4 group-hover:scale-110 transition-transform" /> Centrar formas
+                        </button>
+                    </div>
+                )
+            }
 
             {/* Context Actions (When Selected) - Modified for Bulk Edit */}
             {
@@ -1319,7 +1491,7 @@ export function ContourEditor({
                     <div
                         className="absolute z-50 p-3 bg-black/90 backdrop-blur-xl rounded-xl border border-white/10 shadow-2xl flex flex-col gap-2 min-w-[200px]"
                         style={{
-                            bottom: '20px', right: '20px', top: 'auto', left: 'auto'
+                            top: '50%', right: '20px', transform: 'translateY(-50%)', bottom: 'auto', left: 'auto'
                         }}
                         onMouseDown={(e) => e.stopPropagation()}
                     >
@@ -1347,15 +1519,66 @@ export function ContourEditor({
                                             : 'border-white/5 text-gray-400 hover:bg-white/5 hover:text-white'
                                         }`}
                                 >
-                                    {r === 'cut' && <Scissors className="w-3 h-3" />}
-                                    {r === 'stamp' && <Stamp className="w-3 h-3" />}
-                                    {r === 'base' && <Magnet className="w-3 h-3" />}
                                     {r === 'void' && <FileMinus className="w-3 h-3" />}
                                     <span className="capitalize">
                                         {r === 'cut' ? 'Cortar' : r === 'stamp' ? 'Sellar' : r === 'base' ? 'Base' : 'Hueco'}
                                     </span>
                                 </button>
                             ))}
+                        </div>
+
+                        {/* Flip Tools */}
+                        <div className="flex gap-1">
+                            <button
+                                onClick={(e) => {
+                                    e.stopPropagation();
+                                    const allPoints: THREE.Vector2[] = [];
+                                    selectedIndices.forEach(idx => localContours[idx].forEach(p => allPoints.push(p)));
+                                    if (allPoints.length === 0) return;
+
+                                    const bbox = getRobustBBox(allPoints);
+                                    const center = bbox.getCenter(new THREE.Vector2());
+
+                                    const newContours = [...localContours];
+                                    selectedIndices.forEach(idx => {
+                                        const c = newContours[idx];
+                                        newContours[idx] = c.map(p => {
+                                            const newX = center.x + (center.x - p.x);
+                                            return new THREE.Vector2(newX, p.y);
+                                        });
+                                    });
+                                    update(newContours, localRoles, localNodeTypes);
+                                }}
+                                className="flex-1 py-1.5 px-1 rounded text-[10px] items-center justify-center flex gap-1 border border-white/5 text-gray-400 hover:bg-white/5 hover:text-white transition-colors"
+                                title="Espejar Horizontalmente"
+                            >
+                                <FlipHorizontal className="w-3 h-3" /> Espejar H
+                            </button>
+                            <button
+                                onClick={(e) => {
+                                    e.stopPropagation();
+                                    const allPoints: THREE.Vector2[] = [];
+                                    selectedIndices.forEach(idx => localContours[idx].forEach(p => allPoints.push(p)));
+                                    if (allPoints.length === 0) return;
+
+                                    const bbox = getRobustBBox(allPoints);
+                                    const center = bbox.getCenter(new THREE.Vector2());
+
+                                    const newContours = [...localContours];
+                                    selectedIndices.forEach(idx => {
+                                        const c = newContours[idx];
+                                        newContours[idx] = c.map(p => {
+                                            const newY = center.y + (center.y - p.y);
+                                            return new THREE.Vector2(p.x, newY);
+                                        });
+                                    });
+                                    update(newContours, localRoles, localNodeTypes);
+                                }}
+                                className="flex-1 py-1.5 px-1 rounded text-[10px] items-center justify-center flex gap-1 border border-white/5 text-gray-400 hover:bg-white/5 hover:text-white transition-colors"
+                                title="Espejar Verticalmente"
+                            >
+                                <FlipVertical className="w-3 h-3" /> Espejar V
+                            </button>
                         </div>
 
                         <button
@@ -1419,21 +1642,46 @@ export function ContourEditor({
             }
 
             {/* Top Right Controls (Fullscreen & Reset) - Fullscreen Removed */}
-            <div className="absolute top-4 right-4 flex gap-2 z-20" onMouseDown={(e) => e.stopPropagation()}>
-                {/* Just container kept for layout consistency if needed, or empty */}
-            </div>
+
 
             {/* Reset View Button */}
-            <button
-                onClick={(e) => {
-                    e.stopPropagation();
-                    setView({ x: 0, y: 0, w: width, h: height });
-                }}
-                onMouseDown={(e) => e.stopPropagation()}
-                className="absolute bottom-4 right-4 bg-white/10 hover:bg-white/20 text-white text-xs px-2 py-1 rounded transition z-10"
-            >
-                Resetear Vista
-            </button>
+            {/* Bottom Left Controls (Keyboard Shortcuts) */}
+            <div className="absolute bottom-4 left-4 z-40" onMouseDown={e => e.stopPropagation()}>
+                <button
+                    onClick={() => setShowShortcuts(true)}
+                    className="w-10 h-10 flex items-center justify-center rounded-xl bg-black/80 border border-white/10 text-white hover:bg-white/10 transition-all backdrop-blur-md shadow-lg group"
+                    title="Atajos de teclado"
+                >
+                    <Keyboard className="w-5 h-5 group-hover:scale-110 transition-transform text-blue-400" />
+                </button>
+            </div>
+
+            {/* Bottom Right Controls (Reset & Snapping) */}
+            <div className="absolute bottom-4 right-4 flex gap-2 z-20 items-end" onMouseDown={(e) => e.stopPropagation()}>
+                <button
+                    onClick={(e) => {
+                        e.stopPropagation();
+                        setView({ x: 0, y: 0, w: width, h: height });
+                    }}
+                    className="bg-white/10 hover:bg-white/20 text-white text-xs px-3 py-2 rounded transition backdrop-blur border border-white/5 h-9 flex items-center"
+                >
+                    Resetear Vista
+                </button>
+
+                <div className="relative">
+                    {snapEnabled && <div className="absolute bottom-10 right-0 bg-black/60 text-[9px] text-center text-purple-300 font-mono px-2 py-1 rounded backdrop-blur border border-white/10 whitespace-nowrap mb-1">GRID: {gridSize}px</div>}
+
+                    <button
+                        onClick={(e) => { e.stopPropagation(); setSnapEnabled(!snapEnabled); }}
+                        className={`p-2 rounded transition-colors w-9 h-9 flex items-center justify-center ${snapEnabled ? 'bg-purple-600 text-white shadow-lg shadow-purple-900/50' : 'bg-white/10 text-stone-300 hover:text-white hover:bg-white/20 border border-white/5 backdrop-blur'}`}
+                        title={snapEnabled ? "Desactivar Magnetismo" : "Activar Magnetismo (Imán)"}
+                    >
+                        <Magnet className={`w-4 h-4 ${snapEnabled ? 'fill-current' : ''}`} />
+                    </button>
+                </div>
+            </div>
+
+
 
             <svg
                 ref={svgRef}
@@ -1524,6 +1772,8 @@ export function ContourEditor({
                                 opacity={selectedIndices.size > 0 && !isSelected ? 0.5 : 1}
                                 style={{ cursor: 'pointer' }}
                             >
+                                {/* Top Right Controls: Snapping & Help */}
+
                                 {/* Selection Highlight Halo (behind path) */}
                                 {isSelected && (
                                     <path
@@ -1609,7 +1859,11 @@ export function ContourEditor({
                         )
                     })}
 
-                    {renderGizmo()}
+                    {/* Transform Gizmo (Scale/Rotate) */
+                    }
+                    {
+                        activeTool === 'select' && renderGizmo()
+                    }
 
                     {/* V27: Magic Wand Candidates (Ghosts) */}
                     {activeTool === 'wand' && traceCandidates.map((contour, idx) => (
@@ -1653,8 +1907,14 @@ export function ContourEditor({
                             strokeDasharray="4 4"
                         />
                     )}
+                    {/* V50: Selection Dimensions Layer (Top) */}
+                    <SelectionDimensions selectedIndices={selectedIndices} localContours={localContours} view={view} />
                 </g>
             </svg>
-        </div >
+
+
+            {/* Shortcuts Modal */}
+            {showShortcuts && <ShortcutsHelp onClose={() => setShowShortcuts(false)} />}
+        </div>
     );
 }
